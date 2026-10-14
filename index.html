@@ -4,282 +4,1107 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
 <title>TeamTrack</title>
-<!-- React + Babel + Supabase from CDN — no build step needed -->
 <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#F8FAFC}
-</style>
+<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#F8FAFC}</style>
 </head>
 <body>
 <div id="root"></div>
 <script type="text/babel">
-// ─── PASTE YOUR SUPABASE CREDENTIALS HERE ────────────────────────────────────
+
 const SUPABASE_URL      = "https://zqpzylfdztoqjmrqedpo.supabase.co"
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpxcHp5bGZkenRvcWptcnFlZHBvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMyNzMyNjAsImV4cCI6MjA5ODg0OTI2MH0.KrvALflWAlOTZWNPy0jFh5bu5M9LZGOJvvnX9yJ70W0"
-// ─────────────────────────────────────────────────────────────────────────────
 
 const { createClient } = supabase
 const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+const { useState, useEffect, useCallback, useMemo, useRef } = React
 
-const { useState, useEffect, useCallback, useMemo } = React
-
-const OFFICE_START = "09:30"
-const WORK_DAYS    = [1,2,3,4,5,6]
-
-const pad      = n  => String(n).padStart(2,"0")
-const toISO    = d  => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`
+const OFFICE_START = "10:00"
+const OFFICE_END   = "19:00"   // 7 PM
+const MIN_WORK_HOURS = 8       // must log 8h of working time
+const AUTO_ABSENT_TIME = "11:30"  // after this time, unmarked = absent
+const WORK_DAYS = [1,2,3,4,5,6]
+const pad = n => String(n).padStart(2,"0")
+const toISO = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`
 const todayISO = () => toISO(new Date())
-const mk       = iso => iso.slice(0,7)
+const mk = iso => iso.slice(0,7)
+const nowTime = () => { const n=new Date(); return `${pad(n.getHours())}:${pad(n.getMinutes())}`; }
+const uid = () => Math.random().toString(36).slice(2)+Date.now().toString(36)
+
+// Check if current time is past auto-absent threshold
+function isPastAbsentThreshold(){
+  const n=new Date(), now=n.getHours()*60+n.getMinutes()
+  const[h,m]=AUTO_ABSENT_TIME.split(":").map(Number)
+  return now>=(h*60+m)
+}
+
+// Validate time is not in the future
+function isFuture(t){ if(!t)return false; const[h,m]=t.split(":").map(Number),n=new Date(); return (h*60+m)>(n.getHours()*60+n.getMinutes()); }
+function isBeforeTime(t1,t2){ if(!t1||!t2)return false; const[h1,m1]=t1.split(":").map(Number),[h2,m2]=t2.split(":").map(Number); return (h1*60+m1)<(h2*60+m2); }
+// 5-min back rule: entered time cannot be more than 5 min before current time
+function isTooEarly(t){ if(!t)return false; const[h,m]=t.split(":").map(Number),n=new Date(),nowMins=n.getHours()*60+n.getMinutes(); return (h*60+m)<(nowMins-5); }
+// earliest allowed time = now - 5 min
+function minAllowedTime(){ const n=new Date(); let m=n.getHours()*60+n.getMinutes()-5; if(m<0)m=0; return `${pad(Math.floor(m/60))}:${pad(m%60)}`; }
+// Total office time = first login → end_of_day time (if set) or now
+// Includes lunch gaps — it's the full span inside the office building
+function totalOfficeMins(sessions, attRec){
+  const fl=firstLogin(sessions); if(!fl)return 0;
+  const lo=endOfDayTime(attRec)||nowTime();
+  return calcMins(fl,lo);
+}
+// Total lunch/break mins = office time - working time
+function totalBreakMins(sessions, attRec){
+  return Math.max(0, totalOfficeMins(sessions,attRec) - totalSessionMins(sessions));
+}
+
+// Sessions helpers - sessions = [{login, logout}]
+// Backward compat: if old record has login_time/logout_time, treat as single session
+function getSessions(rec){
+  if(!rec)return[]
+  if(rec.sessions&&rec.sessions.length)return rec.sessions
+  if(rec.login_time)return[{login:rec.login_time,logout:rec.logout_time||null}]
+  return[]
+}
+function totalSessionMins(sessions){
+  return sessions.reduce((s,sess)=>{
+    if(!sess.login)return s
+    if(sess.logout)return s+calcMins(sess.login,sess.logout)
+    return s+calcMins(sess.login,nowTime())
+  },0)
+}
+function isCurrentlyIn(sessions){
+  if(!sessions.length)return false
+  return !sessions[sessions.length-1].logout
+}
+function firstLogin(sessions){ return sessions[0]?.login||null }
+function lastLogout(sessions){
+  // Returns the most recent logout time (last closed session)
+  const done=sessions.filter(s=>s.logout)
+  return done.length?done[done.length-1].logout:null
+}
+// The "end of day" logout — only valid when attRec.end_of_day is set
+function endOfDayTime(attRec){
+  return attRec?.end_of_day||null
+}
 
 function fmtDate(iso,opts={weekday:"short",day:"numeric",month:"short"}){
   return new Date(iso+"T00:00:00").toLocaleDateString("en-IN",opts)
 }
 function fmtMonth(ym){const[y,m]=ym.split("-");return new Date(y,m-1).toLocaleDateString("en-IN",{month:"long",year:"numeric"})}
-function calcMins(login,logout){
-  if(!login)return 0
-  const[lh,lm]=login.split(":").map(Number)
-  if(logout){const[oh,om]=logout.split(":").map(Number);return Math.max(0,(oh*60+om)-(lh*60+lm))}
-  const n=new Date();return Math.max(0,(n.getHours()*60+n.getMinutes())-(lh*60+lm))
+function calcMins(t1,t2){
+  if(!t1||!t2)return 0
+  const[h1,m1]=t1.split(":").map(Number),[h2,m2]=t2.split(":").map(Number)
+  return Math.max(0,(h2*60+m2)-(h1*60+m1))
 }
-function fmtDur(mins){if(!mins||mins<=0)return"—";return`${Math.floor(mins/60)}h ${mins%60}m`}
-const isLate=t=>!!t&&t>OFFICE_START
+function fmtDur(mins){
+  if(!mins||mins<=0)return"—"
+  if(mins<60)return`${mins}m`
+  return`${Math.floor(mins/60)}h ${mins%60>0?mins%60+"m":""}`
+}
+const isLate = t => !!t && t > OFFICE_START
 
 function workingDaysSoFar(ym){
-  const[y,m]=ym.split("-").map(Number)
-  const today=todayISO(),days=new Date(y,m,0).getDate(),res=[]
-  for(let d=1;d<=days;d++){
-    const iso=`${y}-${pad(m)}-${pad(d)}`
-    if(iso>today)break
-    if(WORK_DAYS.includes(new Date(y,m-1,d).getDay()))res.push(iso)
-  }
+  const[y,m]=ym.split("-").map(Number),today=todayISO(),days=new Date(y,m,0).getDate(),res=[]
+  for(let d=1;d<=days;d++){const iso=`${y}-${pad(m)}-${pad(d)}`;if(iso>today)break;if(WORK_DAYS.includes(new Date(y,m-1,d).getDay()))res.push(iso)}
   return res
 }
 
-function exportCSV(reports,leaves){
-  const rows=[["Date","Employee","Status","Login","Logout","Hours","Late","Summary","Tasks","Task%"]]
-  ;[...reports].sort((a,b)=>b.date.localeCompare(a.date)).forEach(r=>{
-    const done=((r.tasks||[]).filter(t=>t.status==="done")).length
-    const tot=(r.tasks||[]).length
-    rows.push([r.date,r.name,r.leave_type||"present",r.login_time||"",r.logout_time||"",
-      fmtDur(calcMins(r.login_time,r.logout_time)),isLate(r.login_time)?"Yes":"No",
-      `"${(r.summary||"").replace(/"/g,'""')}"`,
-      `"${(r.tasks||[]).map(t=>`${t.text}[${t.status}]`).join("; ").replace(/"/g,'""')}"`,
-      tot?`${Math.round((done/tot)*100)}%`:"—"
-    ])
-  })
-  leaves.forEach(l=>rows.push([l.date,l.name,l.type,"","","","","","",""]))
-  const a=document.createElement("a")
-  a.href=URL.createObjectURL(new Blob([rows.map(r=>r.join(",")).join("\n")],{type:"text/csv"}))
-  a.download=`teamtrack-${todayISO()}.csv`;a.click()
-}
-
-const C={primary:"#4F46E5",primary2:"#7C3AED",success:"#059669",warning:"#D97706",danger:"#DC2626",ink:"#0F172A",ink2:"#334155",muted:"#64748B",faint:"#94A3B8",line:"#E2E8F0",surface:"#F8FAFC",white:"#FFFFFF"}
-const G={brand:`linear-gradient(135deg,#4F46E5 0%,#7C3AED 100%)`,soft:`linear-gradient(135deg,#EEF2FF 0%,#F5F3FF 100%)`,teal:`linear-gradient(135deg,#0EA5E9 0%,#4F46E5 100%)`,canvas:`linear-gradient(160deg,#EEF2FF 0%,#F5F3FF 50%,#FAF5FF 100%)`}
+// ─── DESIGN ──────────────────────────────────────────────────────────────────
+const C={primary:"#4F46E5",success:"#059669",warning:"#D97706",danger:"#DC2626",ink:"#0F172A",ink2:"#334155",muted:"#64748B",faint:"#94A3B8",line:"#E2E8F0",surface:"#F8FAFC",white:"#FFFFFF"}
+const G={brand:"linear-gradient(135deg,#4F46E5 0%,#7C3AED 100%)",soft:"linear-gradient(135deg,#EEF2FF 0%,#F5F3FF 100%)",canvas:"linear-gradient(160deg,#EEF2FF 0%,#F5F3FF 50%,#FAF5FF 100%)",teal:"linear-gradient(135deg,#0EA5E9,#4F46E5)"}
+const INP={width:"100%",padding:"10px 13px",border:`1.5px solid ${C.line}`,borderRadius:9,fontSize:14,outline:"none",fontFamily:"inherit",boxSizing:"border-box",background:C.white,color:C.ink}
+const LBL={display:"block",fontSize:11,fontWeight:700,color:C.muted,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:6}
 
 const AV=[["#EDE9FE","#5B21B6"],["#FCE7F3","#9D174D"],["#DCFCE7","#15803D"],["#FEF9C3","#854D0E"],["#FFEDD5","#9A3412"],["#E0F2FE","#0369A1"],["#F0FDF4","#166534"],["#FEE2E2","#991B1B"]]
 function avC(n){let h=0;for(let i=0;i<n.length;i++)h=(h*31+n.charCodeAt(i))&0xffff;return AV[h%AV.length]}
-function Avatar({name,size=36}){
-  const[bg,fg]=avC(name)
-  return <div style={{width:size,height:size,borderRadius:"50%",background:bg,color:fg,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,fontSize:size*.38,flexShrink:0}}>{name.split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase()}</div>
-}
+function Avatar({name,size=36}){const[bg,fg]=avC(name);return <div style={{width:size,height:size,borderRadius:"50%",background:bg,color:fg,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,fontSize:size*.38,flexShrink:0}}>{name.split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase()}</div>}
 
-const INP={width:"100%",padding:"10px 13px",border:`1.5px solid ${C.line}`,borderRadius:9,fontSize:14,outline:"none",fontFamily:"inherit",boxSizing:"border-box",background:C.white,color:C.ink}
-const LBL={display:"block",fontSize:11,fontWeight:700,color:C.muted,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:6}
-const SM={done:{bg:"#DCFCE7",fg:"#15803D",dot:"#22C55E",label:"Done"},progress:{bg:"#FEF9C3",fg:"#854D0E",dot:"#EAB308",label:"In progress"},blocked:{bg:"#FEE2E2",fg:"#991B1B",dot:"#EF4444",label:"Blocked"}}
-const LM={leave:{bg:"#EEF2FF",fg:C.primary,label:"On Leave"},sick:{bg:"#FEF2F2",fg:C.danger,label:"Sick"},wfh:{bg:"#ECFDF5",fg:C.success,label:"WFH"},halfday:{bg:"#FFF7ED",fg:C.warning,label:"Half Day"}}
-
-function TaskBadge({status}){const s=SM[status]||SM.progress;return <span style={{display:"inline-flex",alignItems:"center",gap:4,background:s.bg,color:s.fg,fontSize:11,fontWeight:700,padding:"2px 8px",borderRadius:99,flexShrink:0}}><span style={{width:5,height:5,borderRadius:"50%",background:s.dot}}/>{s.label}</span>}
-function LeavePill({type}){const s=LM[type]||{bg:"#F1F5F9",fg:C.muted,label:type};return <span style={{background:s.bg,color:s.fg,fontSize:12,fontWeight:700,padding:"3px 10px",borderRadius:99}}>{s.label}</span>}
 function Toast({msg,type}){if(!msg)return null;return <div style={{position:"fixed",bottom:24,left:"50%",transform:"translateX(-50%)",background:type==="error"?"#FEF2F2":G.brand,color:type==="error"?C.danger:C.white,padding:"11px 24px",borderRadius:99,fontSize:13,fontWeight:600,zIndex:999,boxShadow:"0 8px 32px rgba(79,70,229,0.25)",pointerEvents:"none",whiteSpace:"nowrap"}}>{msg}</div>}
+
+function Modal({open,onClose,children,width=480}){
+  useEffect(()=>{if(!open)return;const h=e=>{if(e.key==="Escape")onClose()};window.addEventListener("keydown",h);return()=>window.removeEventListener("keydown",h)},[open,onClose])
+  if(!open)return null
+  return <div style={{position:"fixed",inset:0,background:"rgba(15,23,42,0.45)",display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"32px 16px",overflowY:"auto",zIndex:100,backdropFilter:"blur(3px)"}} onClick={e=>{if(e.target===e.currentTarget)onClose()}}>
+    <div style={{background:C.white,borderRadius:18,width:"100%",maxWidth:width,boxShadow:"0 30px 60px rgba(15,23,42,0.2)",overflow:"hidden"}}>{children}</div>
+  </div>
+}
 
 function Confirm({open,title,body,onYes,onNo}){
   if(!open)return null
-  return <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:400,padding:24}}><div style={{background:C.white,borderRadius:16,padding:"28px 30px",maxWidth:400,width:"100%",boxShadow:"0 25px 60px rgba(0,0,0,0.18)"}}><h3 style={{margin:"0 0 8px",fontSize:17,fontWeight:700,color:C.ink}}>{title}</h3><p style={{margin:"0 0 22px",fontSize:14,color:C.muted,lineHeight:1.6}}>{body}</p><div style={{display:"flex",gap:10,justifyContent:"flex-end"}}><button type="button" onClick={onNo} style={{padding:"9px 18px",border:`1.5px solid ${C.line}`,borderRadius:8,background:"none",cursor:"pointer",fontSize:14,color:C.muted,fontFamily:"inherit"}}>Cancel</button><button type="button" onClick={onYes} style={{padding:"9px 18px",border:"none",borderRadius:8,background:C.danger,color:C.white,cursor:"pointer",fontSize:14,fontWeight:600,fontFamily:"inherit"}}>Delete</button></div></div></div>
-}
-
-function Modal({open,onClose,children,width=540}){
-  useEffect(()=>{if(!open)return;const h=e=>{if(e.key==="Escape")onClose()};window.addEventListener("keydown",h);return()=>window.removeEventListener("keydown",h)},[open,onClose])
-  if(!open)return null
-  return <div style={{position:"fixed",inset:0,background:"rgba(15,23,42,0.4)",display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"36px 16px",overflowY:"auto",zIndex:100,backdropFilter:"blur(3px)"}} onClick={e=>{if(e.target===e.currentTarget)onClose()}}><div style={{background:C.white,borderRadius:18,width:"100%",maxWidth:width,boxShadow:"0 30px 60px rgba(15,23,42,0.2)",overflow:"hidden"}}>{children}</div></div>
+  return <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:400,padding:24}}>
+    <div style={{background:C.white,borderRadius:16,padding:"28px 30px",maxWidth:400,width:"100%",boxShadow:"0 25px 60px rgba(0,0,0,0.18)"}}>
+      <h3 style={{margin:"0 0 8px",fontSize:17,fontWeight:700,color:C.ink}}>{title}</h3>
+      <p style={{margin:"0 0 22px",fontSize:14,color:C.muted,lineHeight:1.6}}>{body}</p>
+      <div style={{display:"flex",gap:10,justifyContent:"flex-end"}}>
+        <button type="button" onClick={onNo} style={{padding:"9px 18px",border:`1.5px solid ${C.line}`,borderRadius:8,background:"none",cursor:"pointer",fontSize:14,color:C.muted,fontFamily:"inherit"}}>Cancel</button>
+        <button type="button" onClick={onYes} style={{padding:"9px 18px",border:"none",borderRadius:8,background:C.danger,color:C.white,cursor:"pointer",fontSize:14,fontWeight:600,fontFamily:"inherit"}}>Delete</button>
+      </div>
+    </div>
+  </div>
 }
 
 function Donut({pct,color,size=56,label}){
   const r=22,circ=2*Math.PI*r,dash=((pct||0)/100)*circ
-  return <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:3}}><svg width={size} height={size} viewBox="0 0 52 52"><circle cx="26" cy="26" r={r} fill="none" stroke="#F1F5F9" strokeWidth="6"/><circle cx="26" cy="26" r={r} fill="none" stroke={color} strokeWidth="6" strokeDasharray={`${dash} ${circ}`} strokeLinecap="round" transform="rotate(-90 26 26)"/><text x="26" y="30" textAnchor="middle" fontSize="10" fontWeight="700" fill={color}>{pct||0}%</text></svg>{label&&<span style={{fontSize:10,color:C.faint,textAlign:"center"}}>{label}</span>}</div>
+  return <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
+    <svg width={size} height={size} viewBox="0 0 52 52">
+      <circle cx="26" cy="26" r={r} fill="none" stroke="#F1F5F9" strokeWidth="6"/>
+      <circle cx="26" cy="26" r={r} fill="none" stroke={color} strokeWidth="6" strokeDasharray={`${dash} ${circ}`} strokeLinecap="round" transform="rotate(-90 26 26)"/>
+      <text x="26" y="30" textAnchor="middle" fontSize="10" fontWeight="700" fill={color}>{pct||0}%</text>
+    </svg>
+    {label&&<span style={{fontSize:10,color:C.faint,textAlign:"center"}}>{label}</span>}
+  </div>
 }
 
 function BarChart({data}){
   if(!data?.length)return null
   const max=Math.max(...data.map(d=>d.value),1)
-  return <div style={{display:"flex",flexDirection:"column",gap:6}}><div style={{display:"flex",alignItems:"flex-end",gap:5,height:72}}>{data.map((d,i)=><div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:3}}><span style={{fontSize:10,color:d.highlight?C.primary:C.faint,fontWeight:d.highlight?700:400}}>{d.value||""}</span><div style={{width:"100%",height:`${Math.max(6,(d.value/max)*56)}px`,background:d.highlight?G.brand:`${C.primary}25`,borderRadius:"5px 5px 0 0"}}/></div>)}</div><div style={{display:"flex",gap:5}}>{data.map((d,i)=><div key={i} style={{flex:1,fontSize:9,color:d.highlight?C.primary:C.faint,textAlign:"center",fontWeight:d.highlight?700:400}}>{d.label}</div>)}</div></div>
+  return <div style={{display:"flex",flexDirection:"column",gap:6}}>
+    <div style={{display:"flex",alignItems:"flex-end",gap:5,height:72}}>
+      {data.map((d,i)=><div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
+        <span style={{fontSize:10,color:d.highlight?C.primary:C.faint,fontWeight:d.highlight?700:400}}>{d.value||""}</span>
+        <div style={{width:"100%",height:`${Math.max(6,(d.value/max)*56)}px`,background:d.highlight?G.brand:`${C.primary}25`,borderRadius:"5px 5px 0 0"}}/>
+      </div>)}
+    </div>
+    <div style={{display:"flex",gap:5}}>{data.map((d,i)=><div key={i} style={{flex:1,fontSize:9,color:d.highlight?C.primary:C.faint,textAlign:"center",fontWeight:d.highlight?700:400}}>{d.label}</div>)}</div>
+  </div>
 }
 
+// ─── ATTENDANCE BADGE ─────────────────────────────────────────────────────────
+const ATT={
+  present: {bg:"#DCFCE7",fg:"#15803D",label:"Present"},
+  absent:  {bg:"#FEE2E2",fg:"#991B1B",label:"Absent"},
+  leave:   {bg:"#EEF2FF",fg:"#4338CA",label:"On Leave"},
+  sick:    {bg:"#FEF2F2",fg:C.danger,  label:"Sick"},
+  wfh:     {bg:"#ECFDF5",fg:C.success, label:"WFH"},
+  halfday: {bg:"#FFF7ED",fg:C.warning, label:"Half Day"},
+}
+function AttBadge({type}){const s=ATT[type]||ATT.present;return <span style={{background:s.bg,color:s.fg,fontSize:12,fontWeight:700,padding:"4px 12px",borderRadius:99,whiteSpace:"nowrap"}}>{s.label}</span>}
+
+// ─── TASK CARD ────────────────────────────────────────────────────────────────
+function TaskCard({task,canFinish,onFinish,onDelete,isAdmin}){
+  const dur = calcMins(task.start_time, task.end_time || nowTime())
+  const isRunning = task.status === "running"
+  const borderColor = isRunning?"#C7D2FE":task.status==="done"?"#BBF7D0":"#FECACA"
+  const bg = isRunning?"#EEF2FF":task.status==="done"?"#F0FDF4":"#FEF2F2"
+
+  return <div style={{background:bg,border:`1.5px solid ${borderColor}`,borderRadius:10,padding:"12px 14px"}}>
+    <div style={{display:"flex",alignItems:"flex-start",gap:10}}>
+      <div style={{flex:1}}>
+        <div style={{fontWeight:600,fontSize:14,color:task.status==="done"?C.muted:C.ink,textDecoration:task.status==="done"?"line-through":"none",marginBottom:6}}>{task.task_name||task.name}</div>
+        {/* Time row */}
+        <div style={{display:"flex",gap:10,flexWrap:"wrap",alignItems:"center"}}>
+          <span style={{fontSize:12,color:C.muted,display:"flex",alignItems:"center",gap:4}}>
+            <span style={{fontSize:10,color:C.faint}}>▶ Start</span>
+            <strong style={{color:C.ink}}>{task.start_time||"—"}</strong>
+          </span>
+          {task.end_time&&<span style={{fontSize:12,color:C.muted,display:"flex",alignItems:"center",gap:4}}>
+            <span style={{fontSize:10,color:C.faint}}>■ End</span>
+            <strong style={{color:C.ink}}>{task.end_time}</strong>
+          </span>}
+          {task.start_time&&<span style={{fontSize:12,fontWeight:700,color:isRunning?C.primary:C.success,marginLeft:"auto"}}>
+            {isRunning?"⏳ ":""}{fmtDur(dur)}
+          </span>}
+        </div>
+        {task.status==="blocked"&&<div style={{marginTop:6,fontSize:12,color:C.danger,fontWeight:600}}>⚠ Blocked</div>}
+      </div>
+      {/* Actions */}
+      <div style={{display:"flex",flexDirection:"column",gap:5,flexShrink:0}}>
+        {canFinish&&isRunning&&<button type="button" onClick={()=>onFinish(task)} style={{border:"none",borderRadius:7,padding:"6px 12px",cursor:"pointer",fontSize:12,color:C.white,fontWeight:700,background:G.brand,fontFamily:"inherit",whiteSpace:"nowrap"}}>Mark done</button>}
+        {isAdmin&&<button type="button" onClick={()=>onDelete(task)} style={{background:"none",border:`1px solid #FECACA`,borderRadius:7,padding:"4px 10px",cursor:"pointer",fontSize:11,color:C.danger,fontFamily:"inherit"}}>Delete</button>}
+      </div>
+    </div>
+  </div>
+}
+
+// ─── PUNCH BAR ────────────────────────────────────────────────────────────────
 function PunchBar({loginTime,logoutTime}){
   if(!loginTime)return null
   const toPct=t=>{const[h,m]=t.split(":").map(Number);return Math.max(0,Math.min(100,((h*60+m-360)/960)*100))}
-  const l=toPct(loginTime),now=new Date(),nowT=`${pad(now.getHours())}:${pad(now.getMinutes())}`
-  const r=logoutTime?toPct(logoutTime):toPct(nowT),open=!logoutTime,lp=toPct(OFFICE_START)
-  return <div style={{marginBottom:13}}><div style={{display:"flex",justifyContent:"space-between",fontSize:11,color:C.faint,marginBottom:5}}><span style={{color:isLate(loginTime)?C.danger:C.muted,fontWeight:600}}>{loginTime}{isLate(loginTime)&&" · late"}</span><span>{logoutTime||(open?"still in":"—")}</span></div><div style={{height:6,background:"#F1F5F9",borderRadius:99,position:"relative",overflow:"hidden"}}><div style={{position:"absolute",left:`${lp}%`,top:0,bottom:0,width:1.5,background:"#FCA5A5",zIndex:2}}/><div style={{height:"100%",marginLeft:`${l}%`,width:`${Math.max(1,r-l)}%`,background:open?G.teal:G.brand,borderRadius:99}}/></div><div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"#CBD5E1",marginTop:3}}><span>6:00</span><span style={{color:"#FCA5A5",fontWeight:600}}>9:30</span><span>22:00</span></div></div>
-}
-
-function ReportCard({report,canEdit,isAdmin,onEdit,onDelete,onCheckout,compact=false}){
-  const mins=calcMins(report.login_time,report.logout_time)
-  const isOpen=!report.logout_time&&!report.leave_type
-  const tasks=report.tasks||[]
-  const done=tasks.filter(t=>t.status==="done").length
-  const pct=tasks.length?Math.round((done/tasks.length)*100):null
-  return(
-    <div style={{background:C.white,border:`1px solid ${C.line}`,borderRadius:13,padding:compact?"14px 16px":"18px 20px",boxShadow:"0 1px 3px rgba(15,23,42,0.05)"}}>
-      <div style={{display:"flex",alignItems:"center",gap:11,marginBottom:report.leave_type?0:13}}>
-        <Avatar name={report.name} size={compact?34:40}/>
-        <div style={{flex:1,minWidth:0}}>
-          <div style={{fontWeight:700,fontSize:compact?14:15,color:C.ink,display:"flex",alignItems:"center",gap:7,flexWrap:"wrap"}}>
-            {report.name}
-            {report.leave_type&&<LeavePill type={report.leave_type}/>}
-            {isLate(report.login_time)&&!report.leave_type&&<span style={{fontSize:11,background:"#FEF2F2",color:C.danger,padding:"2px 8px",borderRadius:99,fontWeight:700}}>Late</span>}
-            {isOpen&&<span style={{fontSize:10,background:"#DCFCE7",color:"#15803D",padding:"2px 7px",borderRadius:99,fontWeight:700}}>● In office</span>}
-          </div>
-          <div style={{fontSize:11,color:C.faint,marginTop:2}}>{fmtDate(report.date)}</div>
-        </div>
-        <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:5}}>
-          {!report.leave_type&&<div style={{textAlign:"right"}}><div style={{fontSize:13,fontWeight:700,background:G.brand,WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>{fmtDur(mins)}</div>{pct!==null&&<div style={{fontSize:11,color:C.faint}}>{pct}% done</div>}</div>}
-          {(canEdit||isAdmin)&&<div style={{display:"flex",gap:5}}><button type="button" onClick={()=>onEdit(report)} style={{background:C.surface,border:`1px solid ${C.line}`,borderRadius:6,padding:"4px 10px",cursor:"pointer",fontSize:11,color:C.muted,fontFamily:"inherit"}}>Edit</button>{isAdmin&&<button type="button" onClick={()=>onDelete(report)} style={{background:"#FEF2F2",border:"1px solid #FECACA",borderRadius:6,padding:"4px 10px",cursor:"pointer",fontSize:11,color:C.danger,fontFamily:"inherit"}}>Delete</button>}</div>}
-          {canEdit&&isOpen&&<button type="button" onClick={()=>onCheckout(report)} style={{border:"none",borderRadius:7,padding:"5px 11px",cursor:"pointer",fontSize:11,color:C.white,fontWeight:700,background:G.brand,fontFamily:"inherit",whiteSpace:"nowrap"}}>⏱ Check out</button>}
-        </div>
-      </div>
-      {!report.leave_type&&<>
-        <PunchBar loginTime={report.login_time} logoutTime={report.logout_time}/>
-        {report.summary&&<p style={{fontSize:13.5,lineHeight:1.65,color:C.ink2,margin:"0 0 11px",whiteSpace:"pre-wrap"}}>{report.summary}</p>}
-        {tasks.length>0&&<div style={{display:"flex",flexDirection:"column",gap:6}}>{tasks.map((t,i)=><div key={i} style={{display:"flex",alignItems:"center",gap:8,fontSize:13}}><TaskBadge status={t.status}/><span style={{color:t.status==="done"?C.faint:C.ink2,textDecoration:t.status==="done"?"line-through":"none"}}>{t.text}</span></div>)}</div>}
-      </>}
+  const l=toPct(loginTime),r=logoutTime?toPct(logoutTime):toPct(nowTime()),open=!logoutTime
+  return <div>
+    <div style={{display:"flex",justifyContent:"space-between",fontSize:11,marginBottom:4}}>
+      <span style={{color:isLate(loginTime)?C.danger:C.muted,fontWeight:600}}>{loginTime}{isLate(loginTime)&&<span style={{color:C.danger}}> · Late</span>}</span>
+      <span style={{color:C.muted}}>{logoutTime||(open?"still in":"—")}</span>
     </div>
-  )
+    <div style={{height:7,background:"#F1F5F9",borderRadius:99,position:"relative",overflow:"hidden"}}>
+      <div style={{position:"absolute",left:`${toPct(OFFICE_START)}%`,top:0,bottom:0,width:1.5,background:"#FCA5A5",zIndex:2}}/>
+      <div style={{height:"100%",marginLeft:`${l}%`,width:`${Math.max(1,r-l)}%`,background:open?G.teal:G.brand,borderRadius:99}}/>
+    </div>
+    <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"#CBD5E1",marginTop:2}}><span>6:00</span><span style={{color:"#FCA5A5"}}>9:30</span><span>22:00</span></div>
+  </div>
 }
 
-function ReportForm({open,onClose,onSave,existing,currentUser,prevTasks}){
-  const blank={name:currentUser||"",date:todayISO(),login_time:"",logout_time:"",summary:"",tasks:[],leave_type:""}
-  const[form,setForm]=useState(blank)
+// ─── CHECK-IN MODAL ───────────────────────────────────────────────────────────
+function CheckInModal({open,onClose,onSave,user,existing}){
+  const[att,setAtt]=useState("present")
+  const[loginTime,setLoginTime]=useState(nowTime())
   const[saving,setSaving]=useState(false)
   const[err,setErr]=useState("")
-  const[showCarry,setShowCarry]=useState(false)
 
   useEffect(()=>{
     if(!open)return;setErr("")
-    if(existing){setForm({...existing,tasks:(existing.tasks||[]).map(t=>({...t,_uid:t._uid||Math.random().toString(36).slice(2)}))});setShowCarry(false)}
-    else{const carry=(prevTasks||[]).filter(t=>t.status!=="done").map(t=>({...t,_uid:Math.random().toString(36).slice(2),carriedOver:true,status:"progress"}));setForm({...blank,name:currentUser||"",tasks:carry});setShowCarry(carry.length>0)}
-  },[open,existing,currentUser])
+    if(existing){
+      setAtt(existing.attendance||"present")
+      // For re-login: default to now
+      setLoginTime(nowTime())
+    } else {
+      setAtt("present");setLoginTime(nowTime())
+    }
+  },[open,existing])
 
-  const set=(k,v)=>setForm(f=>({...f,[k]:v}))
-  const setT=(i,k,v)=>setForm(f=>{const t=[...f.tasks];t[i]={...t[i],[k]:v};return{...f,tasks:t}})
-  const addT=()=>setForm(f=>({...f,tasks:[...f.tasks,{text:"",status:"progress",_uid:Date.now()+""}]}))
-  const rmT=i=>setForm(f=>({...f,tasks:f.tasks.filter((_,j)=>j!==i)}))
+  const isRelogin = existing && getSessions(existing).length>0 && !isCurrentlyIn(getSessions(existing))
 
   async function save(){
-    if(!form.name){setErr("Please select your name.");return}
-    if(!form.leave_type&&(!form.login_time||!form.summary.trim())){setErr("Fill in login time and work summary.");return}
+    if(att==="present"&&!loginTime){setErr("Please enter your login time.");return}
+    if(att==="present"&&isFuture(loginTime)){setErr("Login time cannot be in the future.");return}
+    if(att==="present"&&isTooEarly(loginTime)){setErr(`Time too early — you can only enter a time within 5 minutes of now (earliest: ${minAllowedTime()}).`);return}
     setSaving(true)
-    await onSave({...form,tasks:form.tasks.filter(t=>t.text.trim()),id:existing?.id||`${form.name.toLowerCase().replace(/\s+/g,"_")}_${form.date}_${Date.now()}`})
+
+    let sessions = getSessions(existing)
+    let payload
+
+    if(att==="present"&&existing){
+      // Add new session or start fresh
+      if(isRelogin){
+        // Re-login: add new session
+        sessions = [...sessions, {login:loginTime, logout:null}]
+      } else if(sessions.length===0){
+        sessions = [{login:loginTime, logout:null}]
+      }
+      payload={
+        ...existing,
+        attendance:"present",
+        sessions,
+        login_time:firstLogin(sessions),
+        logout_time:null,
+        summary:existing.summary||""
+      }
+    } else {
+      payload={
+        id:existing?.id||`att_${user.toLowerCase().replace(/\s+/g,"_")}_${todayISO()}_${uid()}`,
+        name:user, date:todayISO(), type:"attendance",
+        attendance:att,
+        sessions:att==="present"?[{login:loginTime,logout:null}]:[],
+        login_time:att==="present"?loginTime:null,
+        logout_time:null,
+        summary:existing?.summary||""
+      }
+    }
+    await onSave(payload)
     setSaving(false);onClose()
   }
 
-  return(
-    <Modal open={open} onClose={onClose}>
-      <div style={{padding:"22px 26px 16px",background:G.soft,borderBottom:`1px solid ${C.line}`}}>
-        <h2 style={{margin:0,fontSize:20,fontWeight:800,color:"#1E1B4B"}}>{existing?"Edit report":"Log today's work"}</h2>
-        <p style={{margin:"4px 0 0",fontSize:13,color:C.primary}}>Saved to your monthly record automatically.</p>
-      </div>
-      <div style={{padding:"20px 26px",maxHeight:"60vh",overflowY:"auto",display:"flex",flexDirection:"column",gap:14}}>
-        {showCarry&&<div style={{background:"#EEF2FF",border:`1px solid #C7D2FE`,borderRadius:9,padding:"10px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}><span style={{fontSize:13,color:C.primary,fontWeight:500}}>↩ {form.tasks.length} unfinished task{form.tasks.length!==1?"s":""} carried from yesterday.</span><button type="button" onClick={()=>{setForm(f=>({...f,tasks:[]}));setShowCarry(false)}} style={{background:"none",border:"none",color:C.primary,cursor:"pointer",fontSize:12,fontWeight:600}}>Remove</button></div>}
-        <div>
-          <label style={LBL}>Status today</label>
-          <div style={{display:"flex",gap:7,flexWrap:"wrap"}}>
-            {["present","leave","sick","wfh","halfday"].map(s=>{
-              const active=(s==="present"&&!form.leave_type)||(form.leave_type===s)
-              const labels={present:"Present",leave:"On Leave",sick:"Sick",wfh:"WFH",halfday:"Half Day"}
-              return <button key={s} type="button" onClick={()=>set("leave_type",s==="present"?"":s)} style={{padding:"7px 14px",borderRadius:99,fontSize:12,fontWeight:700,cursor:"pointer",border:"1.5px solid",borderColor:active?C.primary:C.line,background:active?G.brand:C.white,color:active?C.white:C.muted,fontFamily:"inherit"}}>{labels[s]}</button>
-            })}
-          </div>
+  return <Modal open={open} onClose={onClose} width={420}>
+    <div style={{padding:"20px 24px 14px",background:G.soft,borderBottom:`1px solid ${C.line}`}}>
+      <h2 style={{margin:0,fontSize:18,fontWeight:800,color:"#1E1B4B"}}>{isRelogin?"Re-login":"Mark attendance"}</h2>
+      <p style={{margin:"3px 0 0",fontSize:13,color:C.primary}}>{isRelogin?"Enter your re-login time to start a new session.":fmtDate(todayISO(),{weekday:"long",day:"numeric",month:"long"})}</p>
+    </div>
+    <div style={{padding:"18px 24px",display:"flex",flexDirection:"column",gap:16}}>
+      <div>
+        <label style={LBL}>Status</label>
+        <div style={{display:"flex",gap:7,flexWrap:"wrap"}}>
+          {["present","leave","sick","wfh","halfday","absent"].map(s=>(
+            <button key={s} type="button" onClick={()=>setAtt(s)} style={{padding:"8px 14px",borderRadius:99,fontSize:12,fontWeight:700,cursor:"pointer",border:"1.5px solid",borderColor:att===s?C.primary:C.line,background:att===s?G.brand:C.white,color:att===s?C.white:C.muted,fontFamily:"inherit"}}>
+              {{present:"Present",leave:"On Leave",sick:"Sick",wfh:"WFH",halfday:"Half Day",absent:"Absent"}[s]}
+            </button>
+          ))}
         </div>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-          <div><label style={LBL}>Name</label><input style={INP} value={form.name} readOnly placeholder="Your name"/></div>
-          <div><label style={LBL}>Date</label><input type="date" style={INP} value={form.date} onChange={e=>set("date",e.target.value)}/></div>
-        </div>
-        {!form.leave_type&&<>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-            <div><label style={LBL}>Login time</label><input type="time" style={INP} value={form.login_time} onChange={e=>set("login_time",e.target.value)}/>{isLate(form.login_time)&&<p style={{margin:"4px 0 0",fontSize:11,color:C.danger,fontWeight:600}}>⚠ After 9:30 — marked late</p>}</div>
-            <div><label style={LBL}>Logout time</label><input type="time" style={INP} value={form.logout_time} onChange={e=>set("logout_time",e.target.value)}/></div>
-          </div>
-          <div><label style={LBL}>Work summary</label><textarea style={{...INP,minHeight:80,resize:"vertical",lineHeight:1.55}} value={form.summary} onChange={e=>set("summary",e.target.value)} placeholder="What did you work on today?"/></div>
-          <div>
-            <label style={LBL}>Tasks</label>
-            <div style={{display:"flex",flexDirection:"column",gap:8}}>
-              {form.tasks.map((t,i)=><div key={t._uid||i} style={{display:"flex",gap:7,alignItems:"center"}}><input style={{...INP,flex:1}} value={t.text} onChange={e=>setT(i,"text",e.target.value)} placeholder={`Task ${i+1}`}/><select style={{...INP,width:120,flexShrink:0}} value={t.status} onChange={e=>setT(i,"status",e.target.value)}><option value="progress">In progress</option><option value="done">Done</option><option value="blocked">Blocked</option></select><button type="button" onClick={e=>{e.stopPropagation();rmT(i)}} style={{background:"none",border:"none",color:C.danger,cursor:"pointer",fontSize:20,lineHeight:1,padding:"0 4px",flexShrink:0}}>×</button></div>)}
-              <button type="button" onClick={addT} style={{background:C.surface,border:`1.5px dashed ${C.line}`,borderRadius:8,padding:"9px 13px",cursor:"pointer",fontSize:13,color:C.primary,fontWeight:600,textAlign:"left",fontFamily:"inherit"}}>+ Add task</button>
-            </div>
-          </div>
-        </>}
-        {err&&<p style={{color:C.danger,fontSize:13,margin:0,fontWeight:500}}>{err}</p>}
       </div>
-      <div style={{padding:"14px 26px",borderTop:`1px solid ${C.line}`,display:"flex",justifyContent:"flex-end",gap:10,background:C.surface}}>
-        <button type="button" onClick={onClose} style={{padding:"10px 20px",border:`1.5px solid ${C.line}`,borderRadius:9,background:"none",cursor:"pointer",fontSize:14,color:C.muted,fontFamily:"inherit"}}>Cancel</button>
-        <button type="button" onClick={save} disabled={saving} style={{padding:"10px 24px",border:"none",borderRadius:9,background:G.brand,color:C.white,cursor:"pointer",fontSize:14,fontWeight:700,opacity:saving?.7:1,fontFamily:"inherit"}}>{saving?"Saving…":existing?"Save changes":"Submit report"}</button>
-      </div>
-    </Modal>
-  )
+      {att==="present"&&<div>
+        <label style={LBL}>{isRelogin?"Re-login time":"Login time"}</label>
+        <input type="time" style={INP} value={loginTime} min={minAllowedTime()} max={nowTime()} onChange={e=>setLoginTime(e.target.value)}/>
+        <p style={{margin:"5px 0 0",fontSize:11,color:C.muted}}>⏱ Allowed: {minAllowedTime()} – {nowTime()} (within 5 min of now)</p>
+        {isFuture(loginTime)&&<p style={{margin:"4px 0 0",fontSize:12,color:C.danger,fontWeight:600}}>⚠ Cannot be in the future</p>}
+        {isTooEarly(loginTime)&&<p style={{margin:"4px 0 0",fontSize:12,color:C.danger,fontWeight:600}}>⚠ Too early — earliest allowed is {minAllowedTime()}</p>}
+        {!isFuture(loginTime)&&!isTooEarly(loginTime)&&isLate(loginTime)&&<p style={{margin:"4px 0 0",fontSize:12,color:C.warning,fontWeight:600}}>⚠ After 10:00 AM — will be marked late</p>}
+      </div>}
+      {err&&<p style={{color:C.danger,fontSize:13,margin:0}}>{err}</p>}
+    </div>
+    <div style={{padding:"12px 24px",borderTop:`1px solid ${C.line}`,display:"flex",justifyContent:"flex-end",gap:10,background:C.surface}}>
+      <button type="button" onClick={onClose} style={{padding:"9px 18px",border:`1.5px solid ${C.line}`,borderRadius:9,background:"none",cursor:"pointer",fontSize:14,color:C.muted,fontFamily:"inherit"}}>Cancel</button>
+      <button type="button" onClick={save} disabled={saving} style={{padding:"9px 22px",border:"none",borderRadius:9,background:G.brand,color:C.white,cursor:"pointer",fontSize:14,fontWeight:700,opacity:saving?.7:1,fontFamily:"inherit"}}>{saving?"Saving…":"Confirm"}</button>
+    </div>
+  </Modal>
 }
 
-function LeaveForm({open,onClose,onSave,employees}){
-  const[name,setName]=useState("");const[date,setDate]=useState(todayISO());const[type,setType]=useState("leave")
-  async function save(){if(!name)return;await onSave({id:`lv_${name}_${date}_${Date.now()}`,name,date,type});setName("");onClose()}
-  return(
-    <Modal open={open} onClose={onClose} width={380}>
-      <div style={{padding:"20px 24px 14px",background:G.soft,borderBottom:`1px solid ${C.line}`}}><h2 style={{margin:0,fontSize:18,fontWeight:800,color:"#1E1B4B"}}>Mark absence</h2></div>
-      <div style={{padding:"18px 24px",display:"flex",flexDirection:"column",gap:12}}>
-        <div><label style={LBL}>Employee</label><select style={INP} value={name} onChange={e=>setName(e.target.value)}><option value="">Select…</option>{employees.map(e=><option key={e} value={e}>{e}</option>)}</select></div>
-        <div><label style={LBL}>Date</label><input type="date" style={INP} value={date} onChange={e=>setDate(e.target.value)}/></div>
-        <div><label style={LBL}>Type</label><select style={INP} value={type} onChange={e=>setType(e.target.value)}><option value="leave">On Leave</option><option value="sick">Sick</option><option value="wfh">WFH</option><option value="halfday">Half Day</option></select></div>
+// ─── ADD TASK MODAL ───────────────────────────────────────────────────────────
+function AddTaskModal({open,onClose,onSave,user}){
+  const[name,setName]=useState("")
+  const[startTime,setStartTime]=useState(nowTime())
+  const[saving,setSaving]=useState(false)
+  const[err,setErr]=useState("")
+
+  useEffect(()=>{if(open){setName("");setStartTime(nowTime());setErr("")}},[open])
+
+  async function save(){
+    if(!name.trim()){setErr("Please enter a task name.");return}
+    if(isFuture(startTime)){setErr("Start time cannot be in the future.");return}
+    setSaving(true)
+    await onSave({
+      id:`task_${user.toLowerCase().replace(/\s+/g,"_")}_${todayISO()}_${uid()}`,
+      name:user, date:todayISO(), type:"task",
+      task_name:name.trim(), start_time:startTime, end_time:null, status:"running"
+    })
+    setSaving(false);onClose()
+  }
+
+  return <Modal open={open} onClose={onClose} width={400}>
+    <div style={{padding:"20px 24px 14px",background:"linear-gradient(135deg,#ECFDF5,#D1FAE5)",borderBottom:`1px solid ${C.line}`}}>
+      <h2 style={{margin:0,fontSize:18,fontWeight:800,color:"#064E3B"}}>▶ Start a task</h2>
+      <p style={{margin:"3px 0 0",fontSize:13,color:C.success}}>This will be tracked with start &amp; finish time.</p>
+    </div>
+    <div style={{padding:"18px 24px",display:"flex",flexDirection:"column",gap:14}}>
+      <div>
+        <label style={LBL}>Task / project name</label>
+        <input style={INP} value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. Video editing for Reel, Client call with Zara, Logo design…" autoFocus onKeyDown={e=>{if(e.key==="Enter")save()}}/>
       </div>
-      <div style={{padding:"12px 24px",borderTop:`1px solid ${C.line}`,display:"flex",justifyContent:"flex-end",gap:10,background:C.surface}}>
-        <button type="button" onClick={onClose} style={{padding:"9px 18px",border:`1.5px solid ${C.line}`,borderRadius:9,background:"none",cursor:"pointer",fontSize:14,color:C.muted,fontFamily:"inherit"}}>Cancel</button>
-        <button type="button" onClick={save} style={{padding:"9px 20px",border:"none",borderRadius:9,background:G.brand,color:C.white,cursor:"pointer",fontSize:14,fontWeight:700,fontFamily:"inherit"}}>Save</button>
+      <div>
+        <label style={LBL}>Start time</label>
+        <input type="time" style={INP} value={startTime} onChange={e=>setStartTime(e.target.value)}/>
+        {isFuture(startTime)&&<p style={{margin:"5px 0 0",fontSize:12,color:C.danger,fontWeight:600}}>⚠ Start time cannot be in the future</p>}
       </div>
-    </Modal>
-  )
+      {err&&<p style={{color:C.danger,fontSize:13,margin:0}}>{err}</p>}
+    </div>
+    <div style={{padding:"12px 24px",borderTop:`1px solid ${C.line}`,display:"flex",justifyContent:"flex-end",gap:10,background:C.surface}}>
+      <button type="button" onClick={onClose} style={{padding:"9px 18px",border:`1.5px solid ${C.line}`,borderRadius:9,background:"none",cursor:"pointer",fontSize:14,color:C.muted,fontFamily:"inherit"}}>Cancel</button>
+      <button type="button" onClick={save} disabled={saving} style={{padding:"9px 22px",border:"none",borderRadius:9,background:C.success,color:C.white,cursor:"pointer",fontSize:14,fontWeight:700,opacity:saving?.7:1,fontFamily:"inherit"}}>{saving?"Saving…":"Start task"}</button>
+    </div>
+  </Modal>
 }
 
-function EmpRow({name,reps,lvs,wdCount}){
-  const present=reps.filter(r=>!r.leave_type&&r.login_time).length
-  const late=reps.filter(r=>isLate(r.login_time)&&!r.leave_type).length
-  const totalMins=reps.reduce((s,r)=>s+calcMins(r.login_time,r.logout_time),0)
-  const avgMins=present?Math.round(totalMins/present):0
-  const allT=reps.flatMap(r=>r.tasks||[])
-  const doneT=allT.filter(t=>t.status==="done").length
-  const tPct=allT.length?Math.round((doneT/allT.length)*100):null
-  const attPct=wdCount?Math.round(((present+lvs.length)/wdCount)*100):0
-  return(
-    <div style={{padding:"14px 20px",borderBottom:`1px solid ${C.surface}`,display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}>
-      <Avatar name={name} size={40}/>
-      <div style={{flex:1,minWidth:120}}>
-        <div style={{fontWeight:700,fontSize:14,color:C.ink}}>{name}</div>
-        <div style={{fontSize:12,color:C.faint,marginTop:2}}>{present}d present · {late>0&&<span style={{color:C.danger}}>{late} late · </span>}{lvs.length} leaves · avg {fmtDur(avgMins)}/day</div>
-        {late>2&&<div style={{marginTop:5,background:"#FEF2F2",borderRadius:6,padding:"4px 9px",fontSize:11,color:C.danger,fontWeight:600,display:"inline-block"}}>⚠ Late {late}× this month</div>}
+// ─── FINISH TASK MODAL ────────────────────────────────────────────────────────
+function FinishTaskModal({open,onClose,onSave,task}){
+  const[endTime,setEndTime]=useState(nowTime())
+  const[status,setStatus]=useState("done")
+  const[saving,setSaving]=useState(false)
+
+  useEffect(()=>{if(open){setEndTime(nowTime());setStatus("done")}},[open])
+  if(!task)return null
+
+  const dur = calcMins(task.start_time, endTime)
+
+  const[finErr,setFinErr]=useState("")
+  async function save(){
+    if(isFuture(endTime)){setFinErr("Finish time cannot be in the future.");return}
+    if(task.start_time&&!isBeforeTime(task.start_time,endTime)&&task.start_time!==endTime){setFinErr("Finish time must be after start time.");return}
+    setSaving(true)
+    await onSave({...task, end_time:endTime, status})
+    setSaving(false);onClose()
+  }
+
+  return <Modal open={open} onClose={onClose} width={380}>
+    <div style={{padding:"20px 24px 14px",background:"linear-gradient(135deg,#EEF2FF,#E0E7FF)",borderBottom:`1px solid ${C.line}`}}>
+      <h2 style={{margin:0,fontSize:18,fontWeight:800,color:"#1E1B4B"}}>■ Finish task</h2>
+    </div>
+    <div style={{padding:"18px 24px",display:"flex",flexDirection:"column",gap:14}}>
+      <div style={{background:C.surface,borderRadius:10,padding:"12px 14px",border:`1px solid ${C.line}`}}>
+        <div style={{fontWeight:700,fontSize:14,color:C.ink,marginBottom:4}}>{task.task_name}</div>
+        <div style={{fontSize:12,color:C.muted}}>Started at <strong>{task.start_time}</strong>{dur>0&&<span style={{color:C.primary,fontWeight:600,marginLeft:8}}>{fmtDur(dur)} elapsed</span>}</div>
       </div>
-      <div style={{display:"flex",gap:14,alignItems:"center"}}>
-        <Donut pct={attPct} color={C.primary} size={54} label="Attendance"/>
-        {tPct!==null&&<Donut pct={tPct} color={C.success} size={54} label="Tasks done"/>}
+      <div>
+        <label style={LBL}>Finish time</label>
+        <input type="time" style={INP} value={endTime} onChange={e=>setEndTime(e.target.value)}/>
+        {isFuture(endTime)&&<p style={{margin:"5px 0 0",fontSize:12,color:C.danger,fontWeight:600}}>⚠ Finish time cannot be in the future</p>}
+        {!isFuture(endTime)&&task.start_time&&!isBeforeTime(task.start_time,endTime)&&endTime!==task.start_time&&<p style={{margin:"5px 0 0",fontSize:12,color:C.danger,fontWeight:600}}>⚠ Must be after start time ({task.start_time})</p>}
+      </div>
+      <div>
+        <label style={LBL}>Status</label>
+        <div style={{display:"flex",gap:8}}>
+          {["done","blocked"].map(s=>(
+            <button key={s} type="button" onClick={()=>setStatus(s)} style={{flex:1,padding:"10px",borderRadius:9,fontSize:13,fontWeight:700,cursor:"pointer",border:"1.5px solid",borderColor:status===s?C.primary:C.line,background:status===s?G.brand:C.white,color:status===s?C.white:C.muted,fontFamily:"inherit"}}>
+              {s==="done"?"✓ Done":"⚠ Blocked"}
+            </button>
+          ))}
+        </div>
       </div>
     </div>
-  )
+    {finErr&&<div style={{padding:"0 24px 12px"}}><p style={{color:C.danger,fontSize:13,fontWeight:500,margin:0}}>{finErr}</p></div>}
+    <div style={{padding:"12px 24px",borderTop:`1px solid ${C.line}`,display:"flex",justifyContent:"flex-end",gap:10,background:C.surface}}>
+      <button type="button" onClick={onClose} style={{padding:"9px 18px",border:`1.5px solid ${C.line}`,borderRadius:9,background:"none",cursor:"pointer",fontSize:14,color:C.muted,fontFamily:"inherit"}}>Cancel</button>
+      <button type="button" onClick={save} disabled={saving} style={{padding:"9px 22px",border:"none",borderRadius:9,background:G.brand,color:C.white,cursor:"pointer",fontSize:14,fontWeight:700,opacity:saving?.7:1,fontFamily:"inherit"}}>{saving?"Saving…":"Save"}</button>
+    </div>
+  </Modal>
 }
 
+// ─── TASK GATE MODAL (pre-logout: resolve all running tasks) ─────────────────
+function TaskGateModal({open,onClose,runningTasks,onSave,onProceed}){
+  // Each running task needs to be either "done" (with end time) or have a reason
+  const initState = () => runningTasks.reduce((acc,t)=>({...acc,[t.id]:{action:"done",endTime:nowTime(),reason:""}}),{})
+  const[state,setState]=useState(initState)
+  const[saving,setSaving]=useState(false)
+  const[err,setErr]=useState("")
+
+  useEffect(()=>{if(open)setState(initState())},[open,runningTasks.length])
+
+  const set=(id,key,val)=>setState(s=>({...s,[id]:{...s[id],[key]:val}}))
+
+  async function proceed(){
+    // validate
+    for(const t of runningTasks){
+      const s=state[t.id]
+      if(s.action==="done"&&isFuture(s.endTime)){setErr(`End time for "${t.task_name}" cannot be in the future.`);return}
+      if(s.action==="reason"&&!s.reason.trim()){setErr(`Please enter a reason for "${t.task_name}" or mark it done.`);return}
+    }
+    setSaving(true)
+    try{
+      for(const t of runningTasks){
+        const s=state[t.id]
+        if(s.action==="done"){
+          await onSave({...t,end_time:s.endTime,status:"done"})
+        } else {
+          await onSave({...t,end_time:nowTime(),status:"blocked",summary:s.reason})
+        }
+      }
+      onProceed() // open the actual checkout modal
+    }finally{setSaving(false)}
+  }
+
+  if(!open)return null
+  return <Modal open={open} onClose={onClose} width={480}>
+    <div style={{padding:"20px 24px 14px",background:"linear-gradient(135deg,#FFF7ED,#FFEDD5)",borderBottom:`1px solid ${C.line}`}}>
+      <h2 style={{margin:0,fontSize:18,fontWeight:800,color:"#9A3412"}}>⚠️ Unfinished tasks</h2>
+      <p style={{margin:"4px 0 0",fontSize:13,color:"#C2410C"}}>Before you end the day, report each task — mark it done or explain why it's pending.</p>
+    </div>
+    <div style={{padding:"16px 24px",display:"flex",flexDirection:"column",gap:14,maxHeight:"60vh",overflowY:"auto"}}>
+      {runningTasks.map(t=>{
+        const s=state[t.id]||{action:"done",endTime:nowTime(),reason:""}
+        return <div key={t.id} style={{border:`1.5px solid ${C.line}`,borderRadius:12,overflow:"hidden"}}>
+          <div style={{background:C.surface,padding:"10px 14px",borderBottom:`1px solid ${C.line}`}}>
+            <div style={{fontWeight:700,fontSize:13,color:C.ink}}>▶ {t.task_name}</div>
+            <div style={{fontSize:11,color:C.muted,marginTop:2}}>Started {t.start_time}</div>
+          </div>
+          <div style={{padding:"12px 14px",display:"flex",flexDirection:"column",gap:10}}>
+            {/* Toggle: done vs pending reason */}
+            <div style={{display:"flex",gap:8}}>
+              <button type="button" onClick={()=>set(t.id,"action","done")} style={{flex:1,padding:"8px",borderRadius:8,border:"1.5px solid",borderColor:s.action==="done"?C.success:C.line,background:s.action==="done"?"#DCFCE7":C.white,color:s.action==="done"?C.success:C.muted,fontWeight:700,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>
+                ✓ Mark done
+              </button>
+              <button type="button" onClick={()=>set(t.id,"action","reason")} style={{flex:1,padding:"8px",borderRadius:8,border:"1.5px solid",borderColor:s.action==="reason"?C.warning:C.line,background:s.action==="reason"?"#FFF7ED":C.white,color:s.action==="reason"?C.warning:C.muted,fontWeight:700,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>
+                📝 Pending / reason
+              </button>
+            </div>
+            {s.action==="done"&&<div>
+              <label style={LBL}>Finish time</label>
+              <input type="time" style={INP} value={s.endTime} max={nowTime()} onChange={e=>set(t.id,"endTime",e.target.value)}/>
+              {isFuture(s.endTime)&&<p style={{margin:"4px 0 0",fontSize:11,color:C.danger,fontWeight:600}}>⚠ Cannot be in the future</p>}
+            </div>}
+            {s.action==="reason"&&<div>
+              <label style={LBL}>Why is it pending?</label>
+              <input style={INP} value={s.reason} onChange={e=>set(t.id,"reason",e.target.value)} placeholder="e.g. Waiting for client feedback, continuing tomorrow…"/>
+            </div>}
+          </div>
+        </div>
+      })}
+    </div>
+    {err&&<div style={{padding:"0 24px 10px"}}><p style={{color:C.danger,fontSize:13,fontWeight:500,margin:0}}>{err}</p></div>}
+    <div style={{padding:"12px 24px",borderTop:`1px solid ${C.line}`,display:"flex",justifyContent:"flex-end",gap:10,background:C.surface}}>
+      <button type="button" onClick={onClose} style={{padding:"9px 18px",border:`1.5px solid ${C.line}`,borderRadius:9,background:"none",cursor:"pointer",fontSize:14,color:C.muted,fontFamily:"inherit"}}>Cancel</button>
+      <button type="button" onClick={proceed} disabled={saving} style={{padding:"9px 22px",border:"none",borderRadius:9,background:G.brand,color:C.white,cursor:"pointer",fontSize:14,fontWeight:700,opacity:saving?.7:1,fontFamily:"inherit"}}>{saving?"Saving…":"Save & proceed →"}</button>
+    </div>
+  </Modal>
+}
+
+// ─── CHECK-OUT MODAL ──────────────────────────────────────────────────────────
+function CheckOutModal({open,onClose,onSave,attRecord,mode}){
+  const[logoutTime,setLogoutTime]=useState(nowTime())
+  const[summary,setSummary]=useState("")
+  const[saving,setSaving]=useState(false)
+  const[outErr,setOutErr]=useState("")
+
+  const sessions = getSessions(attRecord)
+  const currentSession = sessions[sessions.length-1]
+  const currentLoginTime = currentSession?.login
+
+  useEffect(()=>{if(open){setLogoutTime(nowTime());setSummary(attRecord?.summary||"");setOutErr("")}},[open,attRecord])
+  if(!attRecord)return null
+
+  const sessionMins = calcMins(currentLoginTime, logoutTime)
+  const totalAfter = sessions.slice(0,-1).reduce((s,sess)=>sess.logout?s+calcMins(sess.login,sess.logout):s,0) + sessionMins
+
+  async function save(){
+    if(isFuture(logoutTime)){setOutErr("Logout time cannot be in the future.");return}
+    if(isTooEarly(logoutTime)){setOutErr(`Time too early — earliest allowed is ${minAllowedTime()}.`);return}
+    if(currentLoginTime&&!isBeforeTime(currentLoginTime,logoutTime)&&currentLoginTime!==logoutTime){setOutErr(`Logout must be after login time (${currentLoginTime}).`);return}
+    setSaving(true)
+    // Close the current session
+    const newSessions = sessions.map((s,i)=>i===sessions.length-1?{...s,logout:logoutTime}:s)
+    const payload = {
+      ...attRecord,
+      sessions:newSessions,
+      logout_time:logoutTime,
+      summary
+    }
+    if(mode==="endday") payload.end_of_day = logoutTime  // marks day as truly done
+    await onSave(payload)
+    setSaving(false);onClose()
+  }
+
+  return <Modal open={open} onClose={onClose} width={420}>
+    <div style={{padding:"20px 24px 14px",background:mode==="endday"?"linear-gradient(135deg,#FFF1F2,#FFE4E6)":"linear-gradient(135deg,#FFFBEB,#FEF3C7)",borderBottom:`1px solid ${C.line}`}}>
+      <h2 style={{margin:0,fontSize:18,fontWeight:800,color:mode==="endday"?"#9F1239":"#92400E"}}>{mode==="endday"?"🚪 Ending your day":"🍽️ Going for lunch / stepping out"}</h2>
+      <p style={{margin:"3px 0 0",fontSize:13,color:mode==="endday"?C.danger:C.warning}}>{mode==="endday"?"You won't be able to re-login after this.":"You can re-login when you're back."}</p>
+      {sessions.length>1&&<p style={{margin:"4px 0 0",fontSize:12,color:C.warning}}>Session {sessions.length} of {sessions.length} · Previous sessions: {fmtDur(sessions.slice(0,-1).reduce((s,sess)=>sess.logout?s+calcMins(sess.login,sess.logout):s,0))}</p>}
+    </div>
+    <div style={{padding:"18px 24px",display:"flex",flexDirection:"column",gap:14}}>
+      <div style={{background:C.surface,borderRadius:9,padding:"11px 14px",border:`1px solid ${C.line}`}}>
+        <div style={{fontSize:11,color:C.faint,marginBottom:2}}>Current session started at</div>
+        <div style={{fontSize:16,fontWeight:800,color:C.ink}}>{currentLoginTime||"—"}</div>
+        {sessionMins>0&&<div style={{fontSize:12,color:C.primary,fontWeight:600,marginTop:2}}>This session: {fmtDur(sessionMins)} · Total today: {fmtDur(totalAfter)}</div>}
+      </div>
+      <div>
+        <label style={LBL}>What time are you leaving?</label>
+        <input type="time" style={INP} value={logoutTime} min={minAllowedTime()} max={nowTime()} onChange={e=>setLogoutTime(e.target.value)}/>
+        <p style={{margin:"5px 0 0",fontSize:11,color:C.muted}}>⏱ Allowed: {minAllowedTime()} – {nowTime()} (within 5 min of now)</p>
+        {isFuture(logoutTime)&&<p style={{margin:"4px 0 0",fontSize:12,color:C.danger,fontWeight:600}}>⚠ Cannot be in the future</p>}
+        {isTooEarly(logoutTime)&&<p style={{margin:"4px 0 0",fontSize:12,color:C.danger,fontWeight:600}}>⚠ Too early — earliest allowed is {minAllowedTime()}</p>}
+      </div>
+      <div>
+        <label style={LBL}>Note <span style={{fontWeight:400,textTransform:"none"}}>(optional)</span></label>
+        <textarea style={{...INP,minHeight:58,resize:"vertical",lineHeight:1.55}} value={summary} onChange={e=>setSummary(e.target.value)} placeholder="Any notes…"/>
+      </div>
+    </div>
+    {outErr&&<div style={{padding:"0 24px 12px"}}><p style={{color:C.danger,fontSize:13,fontWeight:500,margin:0}}>{outErr}</p></div>}
+    <div style={{padding:"12px 24px",borderTop:`1px solid ${C.line}`,display:"flex",justifyContent:"flex-end",gap:10,background:C.surface}}>
+      <button type="button" onClick={onClose} style={{padding:"9px 18px",border:`1.5px solid ${C.line}`,borderRadius:9,background:"none",cursor:"pointer",fontSize:14,color:C.muted,fontFamily:"inherit"}}>Cancel</button>
+      <button type="button" onClick={save} disabled={saving} style={{padding:"9px 22px",border:"none",borderRadius:9,background:C.warning,color:C.white,cursor:"pointer",fontSize:14,fontWeight:700,opacity:saving?.7:1,fontFamily:"inherit"}}>{saving?"Saving…":"Log out"}</button>
+    </div>
+  </Modal>
+}
+
+// ─── EMPLOYEE DASHBOARD ───────────────────────────────────────────────────────
+function EmpDashboard({user,records,onSave,onDelete,showToast,onLogout}){
+  const todayISOf = todayISO()
+  const todayRecs = records.filter(r=>r.name===user&&r.date===todayISOf)
+  const attRec    = todayRecs.find(r=>r.type==="attendance")
+  const taskRecs  = todayRecs.filter(r=>r.type==="task").sort((a,b)=>a.start_time?.localeCompare(b.start_time))
+
+  const sessions     = getSessions(attRec)
+  const isPresent    = attRec?.attendance==="present" || (!attRec?.attendance && !!attRec?.login_time)
+  const isCurrentlyLoggedIn = isPresent && isCurrentlyIn(sessions)
+  // isCheckedOut = stepped out (lunch / break) — can re-login
+  // isDoneForDay = explicitly marked end of day via the "End Day" button
+  const isCheckedOut = isPresent && sessions.length>0 && !isCurrentlyLoggedIn && !attRec?.end_of_day
+  const isDoneForDay = isPresent && !!attRec?.end_of_day
+  const totalWorkMins = totalSessionMins(sessions)
+  const runningTasks= taskRecs.filter(t=>t.status==="running")
+  const doneTasks   = taskRecs.filter(t=>t.status==="done")
+  const totalTaskMins = taskRecs.reduce((s,t)=>s+calcMins(t.start_time,t.end_time||nowTime()),0)
+
+  const[checkInOpen, setCheckInOpen]=useState(false)
+  const[addTaskOpen, setAddTaskOpen]=useState(false)
+  const[checkOutOpen,setCheckOutOpen]=useState(false)
+  const[checkOutMode,setCheckOutMode]=useState("lunch") // "lunch" or "endday"
+  const[taskGateOpen,setTaskGateOpen]=useState(false)
+  // End day: if running tasks exist, show gate first; else open checkout directly
+  const openEndDay=()=>{
+    if(runningTasks.length>0){setTaskGateOpen(true)}
+    else{setCheckOutMode("endday");setCheckOutOpen(true)}
+  }
+  const openCheckOut=(mode)=>{setCheckOutMode(mode);setCheckOutOpen(true)}
+  const[finishTask,  setFinishTask]=useState(null)
+  const[delTarget,   setDelTarget]=useState(null)
+
+  // monthly stats - handle both old records (no type) and new records
+  const myMonth = records.filter(r=>r.name===user&&mk(r.date)===mk(todayISOf)&&(r.type==="attendance"||(!r.type&&r.login_time)))
+  const wd = workingDaysSoFar(mk(todayISOf))
+  const presentDays = myMonth.filter(r=>r.attendance==="present"||(!r.attendance&&r.login_time))
+  const attPct = wd.length?Math.round((presentDays.length/wd.length)*100):0
+  const allTasks = records.filter(r=>r.name===user&&(r.type==="task"||(r.tasks&&r.tasks.length)))
+
+  return <div style={{minHeight:"100vh",background:G.canvas}}>
+    {/* Topbar */}
+    <div style={{background:C.white,borderBottom:`1px solid ${C.line}`,position:"sticky",top:0,zIndex:50}}>
+      <div style={{maxWidth:680,margin:"0 auto",padding:"0 20px",display:"flex",alignItems:"center",gap:10,height:56}}>
+        <div style={{width:28,height:28,borderRadius:7,background:G.brand,display:"flex",alignItems:"center",justifyContent:"center"}}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div>
+        <span style={{fontWeight:800,fontSize:14,color:"#1E1B4B"}}>TeamTrack</span>
+        <div style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:9}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,padding:"5px 12px",background:G.soft,borderRadius:99}}><Avatar name={user} size={22}/><span style={{fontSize:13,fontWeight:600,color:C.primary}}>{user}</span></div>
+          <button type="button" onClick={onLogout} style={{background:"none",border:`1.5px solid ${C.line}`,borderRadius:8,padding:"5px 11px",cursor:"pointer",fontSize:12,color:C.faint,fontFamily:"inherit"}}>Log out</button>
+        </div>
+      </div>
+    </div>
+
+    <div style={{maxWidth:680,margin:"0 auto",padding:"22px 20px 80px"}}>
+
+      {/* Hero */}
+      <div style={{background:G.brand,borderRadius:18,padding:"22px 24px 20px",marginBottom:18,color:C.white}}>
+        <div style={{fontSize:12,opacity:.75,marginBottom:3}}>{fmtDate(todayISOf,{weekday:"long",day:"numeric",month:"long",year:"numeric"})}</div>
+        <h2 style={{margin:"0 0 14px",fontSize:20,fontWeight:800}}>Good {new Date().getHours()<12?"morning":new Date().getHours()<17?"afternoon":"evening"}, {user.split(" ")[0]} 👋</h2>
+
+        {!attRec&&!isPastAbsentThreshold()&&<button type="button" onClick={()=>setCheckInOpen(true)} style={{border:"none",borderRadius:10,padding:"12px 20px",background:C.white,color:C.primary,cursor:"pointer",fontSize:14,fontWeight:800,fontFamily:"inherit",display:"flex",alignItems:"center",gap:8}}><span style={{fontSize:16}}>📋</span>Mark today's attendance</button>}
+      {!attRec&&isPastAbsentThreshold()&&<div style={{background:"rgba(220,38,38,0.15)",borderRadius:10,padding:"12px 16px",fontSize:13}}>
+        🔴 <strong>Marked absent</strong> — You did not log in before 11:30 AM. Contact your admin if this is incorrect.
+      </div>}
+
+        {attRec&&!isPresent&&<div style={{background:"rgba(255,255,255,0.15)",borderRadius:10,padding:"11px 14px",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+          <AttBadge type={attRec.attendance}/>
+          <button type="button" onClick={()=>setCheckInOpen(true)} style={{background:"rgba(255,255,255,0.2)",border:"none",borderRadius:8,padding:"6px 12px",cursor:"pointer",fontSize:12,color:C.white,fontFamily:"inherit"}}>Edit</button>
+        </div>}
+
+        {attRec&&isPresent&&<div style={{display:"flex",flexDirection:"column",gap:8}}>
+          {/* Login / logout row */}
+          <div style={{display:"flex",gap:8,alignItems:"stretch"}}>
+            <div style={{background:"rgba(255,255,255,0.12)",borderRadius:10,padding:"10px 14px",flex:1}}>
+              <div style={{fontSize:10,opacity:.6,marginBottom:2}}>ARRIVED</div>
+              <div style={{fontSize:16,fontWeight:800}}>{firstLogin(sessions)||"—"}</div>
+              {isLate(firstLogin(sessions))&&<div style={{fontSize:10,color:"#FCA5A5"}}>Late</div>}
+            </div>
+            <div style={{background:"rgba(255,255,255,0.12)",borderRadius:10,padding:"10px 14px",flex:1}}>
+              <div style={{fontSize:10,opacity:.6,marginBottom:2}}>LEFT / NOW</div>
+              <div style={{fontSize:16,fontWeight:800}}>{isDoneForDay?attRec.end_of_day:nowTime()}</div>
+              <div style={{fontSize:10,opacity:.6}}>{isDoneForDay?"✅ done for day":isCheckedOut?"🍽️ on lunch":"🟢 still inside"}</div>
+            </div>
+            {isCurrentlyLoggedIn&&!isDoneForDay&&
+              <button type="button" onClick={openEndDay} style={{border:"none",borderRadius:10,padding:"10px 14px",background:C.white,color:"#DC2626",cursor:"pointer",fontSize:12,fontWeight:700,fontFamily:"inherit",whiteSpace:"nowrap",flexShrink:0}}>🚪 End day</button>
+            }
+          </div>
+
+          {/* 3-stat summary row */}
+          {(()=>{
+            const officeMins = totalOfficeMins(sessions,attRec)
+            const workMins   = totalSessionMins(sessions)
+            const breakMins  = totalBreakMins(sessions,attRec)
+            return <div style={{display:"flex",gap:6}}>
+              <div style={{flex:1,background:"rgba(255,255,255,0.12)",borderRadius:9,padding:"8px 10px",textAlign:"center"}}>
+                <div style={{fontSize:9,opacity:.6,marginBottom:2,textTransform:"uppercase",letterSpacing:".04em"}}>In Office</div>
+                <div style={{fontSize:14,fontWeight:800}}>{fmtDur(officeMins)}</div>
+              </div>
+              <div style={{flex:1,background:"rgba(79,210,143,0.2)",borderRadius:9,padding:"8px 10px",textAlign:"center",border:"1px solid rgba(79,210,143,0.3)"}}>
+                <div style={{fontSize:9,opacity:.7,marginBottom:2,textTransform:"uppercase",letterSpacing:".04em"}}>Working</div>
+                <div style={{fontSize:14,fontWeight:800,color:"#6EE7B7"}}>{fmtDur(workMins)}</div>
+              </div>
+              <div style={{flex:1,background:"rgba(255,193,7,0.15)",borderRadius:9,padding:"8px 10px",textAlign:"center",border:"1px solid rgba(255,193,7,0.2)"}}>
+                <div style={{fontSize:9,opacity:.7,marginBottom:2,textTransform:"uppercase",letterSpacing:".04em"}}>Lunch</div>
+                <div style={{fontSize:14,fontWeight:800,color:"#FDE68A"}}>{fmtDur(breakMins)||"—"}</div>
+              </div>
+            </div>
+          })()}
+
+          {/* 8-HOUR WARNING — show when logged in and <8h working time with time left in day */}
+          {(()=>{
+            const workMins=totalSessionMins(sessions)
+            const minsNeeded=MIN_WORK_HOURS*60
+            const remaining=minsNeeded-workMins
+            const nowMins=(()=>{const n=new Date();return n.getHours()*60+n.getMinutes()})()
+            const endMins=(()=>{const[h,m]=OFFICE_END.split(":").map(Number);return h*60+m})()
+            const timeLeftInDay=Math.max(0,endMins-nowMins)
+            // Show warning only if working and short on hours and office not over
+            const showWarn=isCurrentlyLoggedIn&&workMins<minsNeeded&&timeLeftInDay>0
+            if(!showWarn)return null
+            const color=remaining>120?"#FCA5A5":remaining>60?"#FDE68A":"#86EFAC"
+            const bg=remaining>120?"rgba(220,38,38,0.15)":remaining>60?"rgba(255,193,7,0.15)":"rgba(134,239,172,0.15)"
+            return <div style={{background:bg,border:`1px solid ${color}40`,borderRadius:9,padding:"9px 12px",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+              <span style={{fontSize:12,fontWeight:600,color}}>{remaining>60?`⏱ ${fmtDur(remaining)} more to complete 8h`:"🔥 Almost at 8h target!"}</span>
+              <span style={{fontSize:11,color:"rgba(255,255,255,0.5)"}}>{fmtDur(workMins)} / 8h</span>
+            </div>
+          })()}
+
+          {/* LUNCH BREAK BUTTON */}
+          {isCurrentlyLoggedIn&&<button type="button" onClick={()=>openCheckOut("lunch")} style={{border:"1px solid rgba(255,193,7,0.4)",borderRadius:10,padding:"11px",background:"rgba(255,193,7,0.12)",color:"#FDE68A",cursor:"pointer",fontSize:14,fontWeight:700,fontFamily:"inherit",width:"100%"}}>
+            🍽️ Going for lunch / stepping out
+          </button>}
+
+          {/* BACK FROM LUNCH */}
+          {isCheckedOut&&<div style={{background:"rgba(255,193,7,0.15)",border:"1px solid rgba(255,193,7,0.35)",borderRadius:10,padding:"12px 16px",textAlign:"center"}}>
+            <div style={{fontSize:12,fontWeight:600,color:"#FDE68A",marginBottom:8}}>☕ On lunch break · working timer paused</div>
+            <button type="button" onClick={()=>setCheckInOpen(true)} style={{border:"none",borderRadius:8,padding:"9px 20px",background:C.white,color:"#7C3AED",cursor:"pointer",fontSize:13,fontWeight:800,fontFamily:"inherit"}}>
+              ✅ Back from lunch — Re-login
+            </button>
+          </div>}
+
+          {/* Break pills */}
+          {sessions.length>1&&sessions.map((sess,i)=>i>0&&sessions[i-1].logout
+            ?<div key={i} style={{background:"rgba(255,255,255,0.07)",borderRadius:8,padding:"5px 10px",fontSize:11,color:"rgba(255,255,255,0.5)",textAlign:"center"}}>
+              ☕ Lunch {sessions[i-1].logout} → {sess.login} ({fmtDur(calcMins(sessions[i-1].logout,sess.login))}) — not in working time
+            </div>:null
+          )}
+        </div>}
+      </div>
+
+      {/* ── ATTENDANCE SECTION ── */}
+      <div style={{background:C.white,border:`1px solid ${C.line}`,borderRadius:14,padding:"16px 18px",marginBottom:14}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:attRec&&isPresent?12:0}}>
+          <div>
+            <div style={{fontWeight:700,fontSize:14,color:C.ink}}>Attendance</div>
+            <div style={{fontSize:12,color:C.faint,marginTop:1}}>{attRec?ATT[attRec.attendance]?.label:"Not marked yet"}</div>
+          </div>
+          {attRec
+            ?<AttBadge type={attRec.attendance}/>
+            :isPastAbsentThreshold()
+              ?<span style={{background:"#FEE2E2",color:C.danger,fontSize:12,fontWeight:700,padding:"4px 12px",borderRadius:99}}>🔴 Absent</span>
+              :<button type="button" onClick={()=>setCheckInOpen(true)} style={{border:"none",borderRadius:8,padding:"8px 14px",background:G.brand,color:C.white,cursor:"pointer",fontSize:13,fontWeight:700,fontFamily:"inherit"}}>Mark now</button>
+          }
+        </div>
+        {attRec&&isPresent&&<div style={{marginTop:10}}>
+        {sessions.map((sess,i)=><React.Fragment key={i}>
+          {i>0&&sessions[i-1].logout&&<div style={{background:"#FFFBEB",border:"1px solid #FDE68A",borderRadius:7,padding:"5px 10px",marginBottom:8,fontSize:11,fontWeight:600,color:"#92400E",display:"flex",alignItems:"center",gap:6}}>
+            <span>☕</span><span>Lunch {sessions[i-1].logout}–{sess.login} ({fmtDur(calcMins(sessions[i-1].logout,sess.login))}) — not counted in office time</span>
+          </div>}
+          <div style={{display:"flex",gap:8,marginBottom:8}}>
+            <div style={{flex:1,background:C.surface,borderRadius:8,padding:"9px 12px",border:`1px solid ${C.line}`}}>
+              <div style={{fontSize:10,fontWeight:700,color:C.faint,textTransform:"uppercase",marginBottom:2}}>{sessions.length>1?`Session ${i+1} · `:""}Login</div>
+              <div style={{fontSize:15,fontWeight:800,color:C.ink}}>{sess.login}</div>
+              {isLate(sess.login)&&i===0&&<div style={{fontSize:10,color:C.danger,fontWeight:600}}>Late</div>}
+            </div>
+            <div style={{flex:1,background:sess.logout?C.surface:"#FFF7ED",borderRadius:8,padding:"9px 12px",border:`1px solid ${sess.logout?C.line:"#FDE68A"}`}}>
+              <div style={{fontSize:10,fontWeight:700,color:C.faint,textTransform:"uppercase",marginBottom:2}}>Logout</div>
+              {sess.logout
+                ?<><div style={{fontSize:15,fontWeight:800,color:C.ink}}>{sess.logout}</div><div style={{fontSize:11,color:C.success,fontWeight:600}}>{fmtDur(calcMins(sess.login,sess.logout))}</div></>
+                :<div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+                  <div style={{fontSize:13,fontWeight:600,color:C.warning}}>Still in</div>
+                  <button type="button" onClick={()=>openCheckOut("lunch")} style={{border:"none",borderRadius:6,padding:"4px 10px",background:C.warning,color:C.white,cursor:"pointer",fontSize:11,fontWeight:700,fontFamily:"inherit"}}>Log out</button>
+                </div>
+              }
+            </div>
+          </div>
+        </React.Fragment>)}
+        {sessions.length>0&&<PunchBar loginTime={firstLogin(sessions)} logoutTime={lastLogout(sessions)}/>}
+        {(()=>{
+          const officeMins=totalOfficeMins(sessions,attRec),workMins=totalSessionMins(sessions),breakMins=totalBreakMins(sessions,attRec)
+          return officeMins>0&&<div style={{display:"flex",gap:6,marginTop:8}}>
+            <div style={{flex:1,background:"#EEF2FF",borderRadius:8,padding:"7px 10px",textAlign:"center"}}>
+              <div style={{fontSize:9,fontWeight:700,color:C.faint,textTransform:"uppercase",marginBottom:1}}>In Office</div>
+              <div style={{fontSize:13,fontWeight:800,color:C.primary}}>{fmtDur(officeMins)}</div>
+            </div>
+            <div style={{flex:1,background:"#F0FDF4",borderRadius:8,padding:"7px 10px",textAlign:"center"}}>
+              <div style={{fontSize:9,fontWeight:700,color:C.faint,textTransform:"uppercase",marginBottom:1}}>Working</div>
+              <div style={{fontSize:13,fontWeight:800,color:C.success}}>{fmtDur(workMins)}</div>
+            </div>
+            <div style={{flex:1,background:"#FFFBEB",borderRadius:8,padding:"7px 10px",textAlign:"center"}}>
+              <div style={{fontSize:9,fontWeight:700,color:C.faint,textTransform:"uppercase",marginBottom:1}}>Lunch</div>
+              <div style={{fontSize:13,fontWeight:800,color:"#D97706"}}>{fmtDur(breakMins)||"—"}</div>
+            </div>
+          </div>
+        })()}
+        {isCheckedOut&&<div style={{marginTop:8,background:"#FFFBEB",border:"1px solid #FDE68A",borderRadius:10,padding:"10px 14px",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+          <div style={{fontSize:12,fontWeight:600,color:"#92400E"}}>🍽️ On lunch break · working timer paused</div>
+          <button type="button" onClick={()=>setCheckInOpen(true)} style={{border:"none",borderRadius:8,padding:"7px 14px",background:"#D97706",color:"#fff",cursor:"pointer",fontSize:12,fontWeight:700,fontFamily:"inherit"}}>✅ Back from lunch</button>
+        </div>}
+        {/* 8-hr target stat */}
+        {isPresent&&(()=>{
+          const workMins=totalSessionMins(sessions)
+          const done=workMins>=(MIN_WORK_HOURS*60)
+          const pct=Math.min(100,Math.round((workMins/(MIN_WORK_HOURS*60))*100))
+          return <div style={{marginTop:8,background:"#F0FDF4",border:"1px solid #86EFAC",borderRadius:9,padding:"9px 12px"}}>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:5,fontSize:12,fontWeight:600,color:done?C.success:"#166534"}}>
+              <span>🎯 Office hours target (10 AM – 7 PM)</span>
+              <span>{fmtDur(workMins)} / 8h {done?"✅":""}</span>
+            </div>
+            <div style={{background:"#D1FAE5",borderRadius:99,height:5,overflow:"hidden"}}>
+              <div style={{width:`${pct}%`,height:"100%",background:done?C.success:C.primary,borderRadius:99,transition:"width 0.3s"}}/>
+            </div>
+            {!done&&<div style={{fontSize:11,color:"#166534",marginTop:4}}>{fmtDur(Math.max(0,MIN_WORK_HOURS*60-workMins))} remaining to reach 8h target</div>}
+          </div>
+        })()}
+      </div>}
+      </div>
+
+      {/* ── TASKS SECTION ── */}
+      <div style={{background:C.white,border:`1px solid ${C.line}`,borderRadius:14,overflow:"hidden",marginBottom:14}}>
+        <div style={{padding:"14px 18px",borderBottom:`1px solid ${C.line}`,display:"flex",alignItems:"center",justifyContent:"space-between",background:"linear-gradient(135deg,#F0FDF4,#DCFCE7)"}}>
+          <div>
+            <div style={{fontWeight:700,fontSize:15,color:"#14532D"}}>📝 Task log</div>
+            <div style={{fontSize:12,color:"#166534",marginTop:1}}>
+              {taskRecs.length===0?"Start your first task below":
+                `${taskRecs.length} tasks · ${doneTasks.length} done · ${runningTasks.length} in progress · ${fmtDur(totalTaskMins)} total time`}
+            </div>
+          </div>
+          {!attRec
+            ?<button type="button" onClick={()=>setCheckInOpen(true)} style={{border:"none",borderRadius:10,padding:"10px 18px",background:"#D97706",color:C.white,cursor:"pointer",fontSize:13,fontWeight:700,fontFamily:"inherit",whiteSpace:"nowrap"}}>
+              Mark attendance first →
+            </button>
+            :(!isPresent&&attRec?.attendance&&!["present"].includes(attRec.attendance))
+            ?<span style={{fontSize:12,color:C.muted}}>N/A ({ATT[attRec.attendance]?.label||attRec.attendance})</span>
+            :isCheckedOut
+            ?<div style={{background:"#FFF7ED",border:"1px solid #FDE68A",borderRadius:10,padding:"8px 12px",fontSize:12,fontWeight:600,color:"#92400E",textAlign:"center"}}>🍽️ On break<br/><span style={{fontWeight:400,fontSize:11}}>Return to log tasks</span></div>
+            :<button type="button" onClick={()=>setAddTaskOpen(true)} style={{border:"none",borderRadius:10,padding:"10px 18px",background:"#16A34A",color:C.white,cursor:"pointer",fontSize:14,fontWeight:800,fontFamily:"inherit",display:"flex",alignItems:"center",gap:6,boxShadow:"0 2px 8px rgba(22,163,74,0.3)"}}>
+              <span style={{fontSize:16}}>▶</span> Start task
+            </button>
+          }
+        </div>
+
+
+
+        {attRec&&!isPresent&&!attRec.login_time&&<div style={{padding:"24px 20px",textAlign:"center",background:C.surface}}>
+          <div style={{fontSize:13,color:C.muted}}>Task logging is only available when marked as Present.</div>
+        </div>}
+
+        {(isPresent||attRec?.login_time)&&taskRecs.length===0&&<div style={{padding:"32px 20px",textAlign:"center"}}>
+          <div style={{fontSize:32,marginBottom:10}}>📝</div>
+          <div style={{fontSize:14,fontWeight:700,color:C.ink}}>No tasks yet</div>
+          <div style={{fontSize:13,marginTop:6,color:C.muted,lineHeight:1.6}}>
+            Whenever you start working on something,<br/>click the green <strong style={{color:"#16A34A"}}>▶ Start task</strong> button above.<br/>
+            Enter the task name and start time.<br/>
+            When finished, click <strong>"Mark done"</strong>.
+          </div>
+        </div>}
+
+        {(isPresent||attRec?.login_time)&&taskRecs.length>0&&<div style={{padding:"12px 14px",display:"flex",flexDirection:"column",gap:8}}>
+          {taskRecs.map(t=><TaskCard key={t.id} task={t} canFinish={isPresent||!!attRec?.login_time} onFinish={setFinishTask} onDelete={setDelTarget} isAdmin={false}/>)}
+        </div>}
+      </div>
+
+      {/* Month stats */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:18}}>
+        {[
+          {label:"Attendance %",value:`${attPct}%`,color:C.primary},
+          {label:"Days present",value:presentDays.length,color:C.success},
+          {label:"Tasks completed",value:records.filter(r=>r.name===user&&r.type==="task"&&r.status==="done").length,color:C.warning},
+        ].map(s=><div key={s.label} style={{background:C.white,border:`1px solid ${C.line}`,borderRadius:12,padding:"13px 15px"}}>
+          <div style={{fontSize:21,fontWeight:800,color:s.color}}>{s.value}</div>
+          <div style={{fontSize:11,color:C.faint,marginTop:2}}>{s.label}</div>
+        </div>)}
+      </div>
+
+      {/* Recent past days */}
+      {(()=>{
+        const pastDays=[...new Set(records.filter(r=>r.name===user&&r.date!==todayISOf).map(r=>r.date))].sort((a,b)=>b.localeCompare(a)).slice(0,5)
+        if(!pastDays.length)return null
+        return <>
+          <h3 style={{margin:"0 0 12px",fontSize:14,fontWeight:700,color:C.ink}}>Recent days</h3>
+          <div style={{display:"flex",flexDirection:"column",gap:10}}>
+            {pastDays.map(date=>{
+              const dayAtt=records.find(r=>r.name===user&&r.date===date&&r.type==="attendance")
+              const dayTasks=records.filter(r=>r.name===user&&r.date===date&&r.type==="task").sort((a,b)=>a.start_time?.localeCompare(b.start_time))
+              const totalMins=calcMins(dayAtt?.login_time,dayAtt?.logout_time)
+              const taskMins=dayTasks.reduce((s,t)=>s+calcMins(t.start_time,t.end_time),0)
+              return <div key={date} style={{background:C.white,border:`1px solid ${C.line}`,borderRadius:12,overflow:"hidden"}}>
+                <div style={{padding:"12px 16px",display:"flex",alignItems:"center",justifyContent:"space-between",borderBottom:dayTasks.length?`1px solid ${C.line}`:"none"}}>
+                  <div>
+                    <div style={{fontWeight:600,fontSize:13,color:C.ink}}>{fmtDate(date,{weekday:"long",day:"numeric",month:"short"})}</div>
+                    {dayAtt&&isPresent&&<div style={{fontSize:12,color:C.faint,marginTop:1}}>{dayAtt.login_time}–{dayAtt.logout_time||"—"} · {fmtDur(totalMins)}</div>}
+                  </div>
+                  {dayAtt&&<AttBadge type={dayAtt.attendance}/>}
+                </div>
+                {dayTasks.length>0&&<div style={{padding:"10px 14px",display:"flex",flexDirection:"column",gap:6}}>
+                  {dayTasks.map(t=><div key={t.id} style={{display:"flex",alignItems:"center",gap:8,fontSize:12}}>
+                    <span style={{width:7,height:7,borderRadius:"50%",flexShrink:0,background:t.status==="done"?C.success:t.status==="blocked"?C.danger:C.primary}}/>
+                    <span style={{flex:1,color:t.status==="done"?C.muted:C.ink,textDecoration:t.status==="done"?"line-through":"none"}}>{t.task_name}</span>
+                    <span style={{color:C.faint,whiteSpace:"nowrap"}}>{t.start_time}{t.end_time&&`→${t.end_time}`}</span>
+                    <span style={{color:C.primary,fontWeight:600,whiteSpace:"nowrap"}}>{fmtDur(calcMins(t.start_time,t.end_time))}</span>
+                  </div>)}
+                  <div style={{fontSize:12,color:C.primary,fontWeight:600,paddingTop:4,borderTop:`1px solid ${C.line}`}}>Total task time: {fmtDur(taskMins)}</div>
+                </div>}
+              </div>
+            })}
+          </div>
+        </>
+      })()}
+    </div>
+
+    <CheckInModal open={checkInOpen} onClose={()=>setCheckInOpen(false)} onSave={onSave} user={user} existing={attRec}/>
+    <AddTaskModal open={addTaskOpen} onClose={()=>setAddTaskOpen(false)} onSave={onSave} user={user}/>
+    <TaskGateModal open={taskGateOpen} onClose={()=>setTaskGateOpen(false)} runningTasks={runningTasks} onSave={onSave} onProceed={()=>{setTaskGateOpen(false);setCheckOutMode("endday");setCheckOutOpen(true)}}/>
+    <CheckOutModal open={checkOutOpen} onClose={()=>setCheckOutOpen(false)} onSave={onSave} attRecord={attRec} mode={checkOutMode}/>
+    {finishTask&&<FinishTaskModal open={true} onClose={()=>setFinishTask(null)} onSave={onSave} task={finishTask}/>}
+    <Confirm open={!!delTarget} title="Delete task?" body={delTarget?`Delete "${delTarget.task_name}"?`:""} onYes={async()=>{await onDelete(delTarget);setDelTarget(null)}} onNo={()=>setDelTarget(null)}/>
+    <Toast msg={""} type={"success"}/>
+  </div>
+}
+
+// ─── ADMIN EMPLOYEE REPORT ────────────────────────────────────────────────────
+function AdminEmployeeDay({name,date,records,onSave,onDelete,employees,autoAbsent=false}){
+  const att   = records.find(r=>r.type==="attendance")
+  const tasks = records.filter(r=>r.type==="task").sort((a,b)=>a.start_time?.localeCompare(b.start_time))
+  const totalWork = calcMins(att?.login_time, att?.logout_time)
+  const totalTask = tasks.reduce((s,t)=>s+calcMins(t.start_time,t.end_time),0)
+  const done = tasks.filter(t=>t.status==="done").length
+
+  // Edit state
+  const[editAtt,setEditAtt]=useState(false)
+  const[editTask,setEditTask]=useState(null)
+  const[addingTask,setAddingTask]=useState(false)
+  const[delTarget,setDelTarget]=useState(null)
+
+  // Inline attendance edit
+  const[attForm,setAttForm]=useState({})
+  useEffect(()=>{
+    if(att)setAttForm({...att})
+    else if(autoAbsent)setAttForm({attendance:"absent",login_time:"",logout_time:"",summary:"",sessions:[]})
+  },[att,autoAbsent])
+
+  async function saveAtt(){
+    const payload=att
+      ?{...attForm}
+      :{
+          id:`att_${name.toLowerCase().replace(/\s+/g,"_")}_${date}_${uid()}`,
+          name, date, type:"attendance",
+          attendance:attForm.attendance||"absent",
+          login_time:attForm.login_time||null,
+          logout_time:attForm.logout_time||null,
+          summary:attForm.summary||"",
+          sessions:attForm.sessions||[]
+        }
+    await onSave(payload)
+    setEditAtt(false)
+  }
+
+  // Inline task edit
+  const[taskForm,setTaskForm]=useState({})
+  useEffect(()=>{if(editTask)setTaskForm({...editTask})},[editTask])
+
+  async function saveTask(){
+    await onSave({...taskForm})
+    setEditTask(null)
+  }
+
+  // Add task as admin for this employee
+  const[newTask,setNewTask]=useState({task_name:"",start_time:"",end_time:"",status:"done"})
+  async function addTask(){
+    if(!newTask.task_name.trim())return
+    await onSave({
+      id:`task_${name.toLowerCase().replace(/\s+/g,"_")}_${date}_${uid()}`,
+      name, date, type:"task",
+      task_name:newTask.task_name.trim(),
+      start_time:newTask.start_time||null,
+      end_time:newTask.end_time||null,
+      status:newTask.status
+    })
+    setNewTask({task_name:"",start_time:"",end_time:"",status:"done"})
+    setAddingTask(false)
+  }
+
+  const btnSm={border:"none",borderRadius:6,padding:"4px 10px",cursor:"pointer",fontSize:11,fontWeight:600,fontFamily:"inherit"}
+
+  return <div style={{background:C.white,border:`1px solid ${C.line}`,borderRadius:13,overflow:"hidden",boxShadow:"0 1px 3px rgba(0,0,0,0.04)"}}>
+    {/* Header */}
+    <div style={{padding:"14px 18px",borderBottom:`1px solid ${C.line}`}}>
+      <div style={{display:"flex",alignItems:"center",gap:11,marginBottom:12}}>
+        <Avatar name={name} size={38}/>
+        <div style={{flex:1}}>
+          <div style={{fontWeight:700,fontSize:15,color:C.ink}}>{name}</div>
+          <div style={{fontSize:11,color:C.faint,marginTop:1}}>{fmtDate(date)}</div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          {att&&<AttBadge type={att.attendance||"present"}/>}
+          {!att&&autoAbsent&&<span style={{background:"#FEE2E2",color:C.danger,fontSize:12,fontWeight:700,padding:"4px 12px",borderRadius:99}}>🔴 Absent (auto)</span>}
+          {!att&&!autoAbsent&&<span style={{fontSize:12,color:C.faint,background:C.surface,padding:"3px 10px",borderRadius:99}}>Not marked</span>}
+          <button type="button" onClick={()=>setEditAtt(true)} style={{...btnSm,background:"#EEF2FF",color:C.primary}}>Override</button>
+          {att&&<button type="button" onClick={()=>setDelTarget(att)} style={{...btnSm,background:"#FEF2F2",color:C.danger}}>Delete</button>}
+        </div>
+      </div>
+
+      {/* Attendance edit form */}
+      {editAtt&&<div style={{background:C.surface,border:`1px solid ${C.line}`,borderRadius:10,padding:"14px",marginBottom:12}}>
+        <div style={{fontSize:12,fontWeight:700,color:C.muted,marginBottom:10}}>EDIT ATTENDANCE</div>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:10}}>
+          {["present","leave","sick","wfh","halfday","absent"].map(s=>(
+            <button key={s} type="button" onClick={()=>setAttForm(f=>({...f,attendance:s}))} style={{padding:"5px 11px",borderRadius:99,fontSize:11,fontWeight:700,cursor:"pointer",border:"1.5px solid",borderColor:attForm.attendance===s?C.primary:C.line,background:attForm.attendance===s?G.brand:C.white,color:attForm.attendance===s?C.white:C.muted,fontFamily:"inherit"}}>
+              {{present:"Present",leave:"On Leave",sick:"Sick",wfh:"WFH",halfday:"Half Day",absent:"Absent"}[s]}
+            </button>
+          ))}
+        </div>
+        {attForm.attendance==="present"&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
+          <div><label style={{...LBL,fontSize:10}}>Login time</label><input type="time" style={INP} value={attForm.login_time||""} onChange={e=>setAttForm(f=>({...f,login_time:e.target.value}))}/></div>
+          <div><label style={{...LBL,fontSize:10}}>Logout time</label><input type="time" style={INP} value={attForm.logout_time||""} onChange={e=>setAttForm(f=>({...f,logout_time:e.target.value}))}/></div>
+        </div>}
+        <div style={{marginBottom:10}}><label style={{...LBL,fontSize:10}}>Note</label><input style={INP} value={attForm.summary||""} onChange={e=>setAttForm(f=>({...f,summary:e.target.value}))} placeholder="Optional note"/></div>
+        <div style={{display:"flex",gap:8}}>
+          <button type="button" onClick={saveAtt} style={{...btnSm,background:G.brand,color:C.white,padding:"7px 16px",fontSize:12}}>Save</button>
+          <button type="button" onClick={()=>setEditAtt(false)} style={{...btnSm,background:C.surface,color:C.muted,border:`1px solid ${C.line}`,padding:"7px 16px",fontSize:12}}>Cancel</button>
+        </div>
+      </div>}
+
+      {/* Attendance display */}
+      {!editAtt&&att?.attendance==="present"&&<>
+        {getSessions(att).map((sess,i)=><div key={i} style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}}>
+          <div style={{background:C.surface,borderRadius:8,padding:"9px 12px",border:`1px solid ${C.line}`}}>
+            <div style={{fontSize:10,fontWeight:700,color:C.faint,textTransform:"uppercase",marginBottom:2}}>{getSessions(att).length>1?`S${i+1} `:""}Login</div>
+            <div style={{fontSize:15,fontWeight:800,color:C.ink}}>{sess.login||"—"}</div>
+            {isLate(sess.login)&&i===0&&<div style={{fontSize:10,color:C.danger,fontWeight:600}}>Late</div>}
+          </div>
+          <div style={{background:sess.logout?C.surface:"#FFF7ED",borderRadius:8,padding:"9px 12px",border:`1px solid ${sess.logout?C.line:"#FDE68A"}`}}>
+            <div style={{fontSize:10,fontWeight:700,color:C.faint,textTransform:"uppercase",marginBottom:2}}>Logout</div>
+            <div style={{fontSize:15,fontWeight:800,color:sess.logout?C.ink:C.warning}}>{sess.logout||"Still in"}</div>
+            {sess.logout&&<div style={{fontSize:10,color:C.success,fontWeight:600}}>{fmtDur(calcMins(sess.login,sess.logout))}</div>}
+          </div>
+        </div>)}
+        <PunchBar loginTime={firstLogin(getSessions(att))} logoutTime={lastLogout(getSessions(att))}/>
+        <div style={{display:"flex",gap:16,marginTop:8,fontSize:12,flexWrap:"wrap"}}>
+          <span style={{color:C.muted}}>In office: <strong style={{color:C.primary}}>{fmtDur(totalSessionMins(getSessions(att)))}</strong></span>
+          {tasks.length>0&&<><span style={{color:C.muted}}>Tasks: <strong style={{color:C.ink}}>{done}/{tasks.length}</strong></span><span style={{color:C.muted}}>Task time: <strong style={{color:C.primary}}>{fmtDur(totalTask)}</strong></span></>}
+        </div>
+        {att.summary&&<div style={{marginTop:8,fontSize:12,color:C.muted,fontStyle:"italic"}}>📝 {att.summary}</div>}
+      </>}
+    </div>
+
+    {/* Tasks section */}
+    <div style={{background:"#FAFAFA",padding:"12px 16px"}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+        <div style={{fontSize:11,fontWeight:700,color:C.muted,textTransform:"uppercase",letterSpacing:"0.05em"}}>Task log ({tasks.length})</div>
+        <button type="button" onClick={()=>setAddingTask(true)} style={{...btnSm,background:"#DCFCE7",color:C.success,padding:"5px 12px"}}>+ Add task</button>
+      </div>
+
+      {/* Add task form */}
+      {addingTask&&<div style={{background:C.white,border:`1px dashed ${C.line}`,borderRadius:9,padding:"12px",marginBottom:10}}>
+        <div style={{display:"grid",gridTemplateColumns:"1fr",gap:8,marginBottom:8}}>
+          <input style={INP} value={newTask.task_name} onChange={e=>setNewTask(f=>({...f,task_name:e.target.value}))} placeholder="Task / project name"/>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:8}}>
+          <div><label style={{...LBL,fontSize:10}}>Start time</label><input type="time" style={INP} value={newTask.start_time} onChange={e=>setNewTask(f=>({...f,start_time:e.target.value}))}/></div>
+          <div><label style={{...LBL,fontSize:10}}>End time</label><input type="time" style={INP} value={newTask.end_time} onChange={e=>setNewTask(f=>({...f,end_time:e.target.value}))}/></div>
+          <div><label style={{...LBL,fontSize:10}}>Status</label>
+            <select style={INP} value={newTask.status} onChange={e=>setNewTask(f=>({...f,status:e.target.value}))}>
+              <option value="done">Done</option>
+              <option value="running">In progress</option>
+              <option value="blocked">Blocked</option>
+            </select>
+          </div>
+        </div>
+        <div style={{display:"flex",gap:8}}>
+          <button type="button" onClick={addTask} style={{...btnSm,background:G.brand,color:C.white,padding:"7px 16px",fontSize:12}}>Add task</button>
+          <button type="button" onClick={()=>setAddingTask(false)} style={{...btnSm,background:C.surface,color:C.muted,border:`1px solid ${C.line}`,padding:"7px 16px",fontSize:12}}>Cancel</button>
+        </div>
+      </div>}
+
+      {tasks.length===0&&!addingTask&&<div style={{textAlign:"center",padding:"16px",color:C.faint,fontSize:13}}>No tasks logged yet.</div>}
+
+      <div style={{display:"flex",flexDirection:"column",gap:7}}>
+        {tasks.map(t=><div key={t.id}>
+          {editTask?.id===t.id
+            ?<div style={{background:C.white,border:`1.5px solid ${C.primary}`,borderRadius:9,padding:"12px"}}>
+              <input style={{...INP,marginBottom:8}} value={taskForm.task_name||""} onChange={e=>setTaskForm(f=>({...f,task_name:e.target.value}))}/>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:8}}>
+                <div><label style={{...LBL,fontSize:10}}>Start</label><input type="time" style={INP} value={taskForm.start_time||""} onChange={e=>setTaskForm(f=>({...f,start_time:e.target.value}))}/></div>
+                <div><label style={{...LBL,fontSize:10}}>End</label><input type="time" style={INP} value={taskForm.end_time||""} onChange={e=>setTaskForm(f=>({...f,end_time:e.target.value}))}/></div>
+                <div><label style={{...LBL,fontSize:10}}>Status</label>
+                  <select style={INP} value={taskForm.status||"done"} onChange={e=>setTaskForm(f=>({...f,status:e.target.value}))}>
+                    <option value="done">Done</option>
+                    <option value="running">In progress</option>
+                    <option value="blocked">Blocked</option>
+                  </select>
+                </div>
+              </div>
+              <div style={{display:"flex",gap:8}}>
+                <button type="button" onClick={saveTask} style={{...btnSm,background:G.brand,color:C.white,padding:"7px 16px",fontSize:12}}>Save</button>
+                <button type="button" onClick={()=>setEditTask(null)} style={{...btnSm,background:C.surface,color:C.muted,border:`1px solid ${C.line}`,padding:"7px 16px",fontSize:12}}>Cancel</button>
+              </div>
+            </div>
+            :<div style={{display:"flex",alignItems:"center",gap:10,background:C.white,border:`1px solid ${C.line}`,borderRadius:8,padding:"9px 12px"}}>
+              <span style={{width:8,height:8,borderRadius:"50%",flexShrink:0,background:t.status==="done"?C.success:t.status==="blocked"?C.danger:C.primary}}/>
+              <span style={{flex:1,fontSize:13,fontWeight:600,color:t.status==="done"?C.muted:C.ink,textDecoration:t.status==="done"?"line-through":"none"}}>{t.task_name}</span>
+              <span style={{fontSize:11,color:C.faint,whiteSpace:"nowrap"}}>{t.start_time||"—"}{t.end_time&&` → ${t.end_time}`}</span>
+              <span style={{fontSize:12,fontWeight:700,color:t.status==="done"?C.success:t.status==="blocked"?C.danger:C.primary,whiteSpace:"nowrap",minWidth:44,textAlign:"right"}}>{fmtDur(calcMins(t.start_time,t.end_time))}</span>
+              <div style={{display:"flex",gap:4,flexShrink:0}}>
+                <button type="button" onClick={()=>setEditTask(t)} style={{...btnSm,background:"#EEF2FF",color:C.primary}}>Edit</button>
+                <button type="button" onClick={()=>setDelTarget(t)} style={{...btnSm,background:"#FEF2F2",color:C.danger}}>Del</button>
+              </div>
+            </div>
+          }
+        </div>)}
+      </div>
+    </div>
+
+    <Confirm open={!!delTarget} title="Delete record?" body={delTarget?`Delete "${delTarget.task_name||delTarget.attendance||"this record"}"? Cannot be undone.`:""} onYes={async()=>{await onDelete(delTarget);setDelTarget(null)}} onNo={()=>setDelTarget(null)}/>
+  </div>
+}
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────────────
 function App(){
   const[employees,setEmployees]=useState([])
-  const[reports,setReports]=useState([])
-  const[leaves,setLeaves]=useState([])
+  const[records,setRecords]=useState([])  // all records (attendance + tasks unified)
   const[adminPin,setAdminPin]=useState("admin123")
   const[loading,setLoading]=useState(true)
   const[user,setUser]=useState(null)
@@ -287,9 +1112,6 @@ function App(){
   const[view,setView]=useState("today")
   const[selMonth,setSelMonth]=useState(mk(todayISO()))
   const[empFilter,setEmpFilter]=useState("")
-  const[formOpen,setFormOpen]=useState(false)
-  const[editRep,setEditRep]=useState(null)
-  const[leaveOpen,setLeaveOpen]=useState(false)
   const[delTarget,setDelTarget]=useState(null)
   const[newEmp,setNewEmp]=useState("")
   const[pinInput,setPinInput]=useState("")
@@ -302,209 +1124,340 @@ function App(){
 
   useEffect(()=>{
     async function load(){
-      const[{data:emps},{data:reps},{data:lvs},{data:sets}]=await Promise.all([
+      const[{data:emps},{data:reps},{data:sets}]=await Promise.all([
         sb.from("employees").select("name").order("name"),
         sb.from("reports").select("*").order("date",{ascending:false}),
-        sb.from("leaves").select("*").order("date",{ascending:false}),
         sb.from("settings").select("*")
       ])
       setEmployees((emps||[]).map(e=>e.name))
-      setReports(reps||[])
-      setLeaves(lvs||[])
-      const pinRow=(sets||[]).find(s=>s.key==="admin_pin")
-      if(pinRow)setAdminPin(pinRow.value)
+      setRecords(reps||[])
+      const p=(sets||[]).find(s=>s.key==="admin_pin");if(p)setAdminPin(p.value)
       setLoading(false)
     }
     load()
   },[])
 
+  // Realtime
   useEffect(()=>{
-    const repSub=sb.channel("reports-rt").on("postgres_changes",{event:"*",schema:"public",table:"reports"},p=>{
-      if(p.eventType==="INSERT")setReports(r=>[p.new,...r])
-      if(p.eventType==="UPDATE")setReports(r=>r.map(x=>x.id===p.new.id?p.new:x))
-      if(p.eventType==="DELETE")setReports(r=>r.filter(x=>x.id!==p.old.id))
+    const sub=sb.channel("rec-rt").on("postgres_changes",{event:"*",schema:"public",table:"reports"},p=>{
+      if(p.eventType==="INSERT")setRecords(r=>[p.new,...r])
+      if(p.eventType==="UPDATE")setRecords(r=>r.map(x=>x.id===p.new.id?p.new:x))
+      if(p.eventType==="DELETE")setRecords(r=>r.filter(x=>x.id!==p.old.id))
     }).subscribe()
-    const lvSub=sb.channel("leaves-rt").on("postgres_changes",{event:"*",schema:"public",table:"leaves"},p=>{
-      if(p.eventType==="INSERT")setLeaves(l=>[p.new,...l])
-      if(p.eventType==="DELETE")setLeaves(l=>l.filter(x=>x.id!==p.old.id))
-    }).subscribe()
-    const empSub=sb.channel("employees-rt").on("postgres_changes",{event:"*",schema:"public",table:"employees"},p=>{
+    const empSub=sb.channel("emp-rt").on("postgres_changes",{event:"*",schema:"public",table:"employees"},p=>{
       if(p.eventType==="INSERT")setEmployees(e=>[...e,p.new.name].sort())
       if(p.eventType==="DELETE")setEmployees(e=>e.filter(x=>x!==p.old.name))
     }).subscribe()
-    return()=>{repSub.unsubscribe();lvSub.unsubscribe();empSub.unsubscribe()}
+    return()=>{sub.unsubscribe();empSub.unsubscribe()}
   },[])
 
   const todayISOf=todayISO()
-  const todayReps=useMemo(()=>reports.filter(r=>r.date===todayISOf),[reports,todayISOf])
-  const monthReps=useMemo(()=>reports.filter(r=>mk(r.date)===selMonth),[reports,selMonth])
-  const monthLvs =useMemo(()=>leaves.filter(l=>mk(l.date)===selMonth),[leaves,selMonth])
-  const myReps   =useMemo(()=>reports.filter(r=>r.name===user).sort((a,b)=>b.date.localeCompare(a.date)),[reports,user])
-  const months   =useMemo(()=>{const s=new Set(reports.map(r=>mk(r.date)));s.add(mk(todayISOf));return Array.from(s).sort((a,b)=>b.localeCompare(a))},[reports,todayISOf])
-  const todayIn  =new Set(todayReps.map(r=>r.name))
-  const todayLv  =new Set(leaves.filter(l=>l.date===todayISOf).map(l=>l.name))
-  const notYet   =employees.filter(e=>!todayIn.has(e)&&!todayLv.has(e))
-  const myToday  =todayReps.find(r=>r.name===user)
-  const wdSoFar  =useMemo(()=>workingDaysSoFar(selMonth),[selMonth])
-  const chartData=useMemo(()=>wdSoFar.slice(-10).map(d=>({label:new Date(d+"T00:00:00").toLocaleDateString("en-IN",{day:"numeric",month:"short"}),value:reports.filter(r=>r.date===d&&!r.leave_type&&r.login_time).length,highlight:d===todayISOf})),[reports,wdSoFar,todayISOf])
-  const prevTasks=useMemo(()=>{if(!user||isAdmin)return[];const yest=toISO(new Date(Date.now()-86400000));const r=reports.find(r=>r.name===user&&r.date===yest);return(r?.tasks||[]).filter(t=>t.status!=="done")},[reports,user,isAdmin])
-  const grouped=useMemo(()=>{const base=(empFilter?monthReps.filter(r=>r.name===empFilter):monthReps).sort((a,b)=>b.date.localeCompare(a.date)||a.name.localeCompare(b.name));const m={};for(const r of base){if(!m[r.date])m[r.date]=[];m[r.date].push(r)}return Object.entries(m)},[monthReps,empFilter])
+  const todayRecs=useMemo(()=>records.filter(r=>r.date===todayISOf),[records,todayISOf])
+  const monthRecs=useMemo(()=>records.filter(r=>mk(r.date)===selMonth),[records,selMonth])
+  const months=useMemo(()=>{const s=new Set(records.map(r=>mk(r.date)));s.add(mk(todayISOf));return Array.from(s).sort((a,b)=>b.localeCompare(a))},[records,todayISOf])
 
-  async function saveReport(form){
-    const payload={id:form.id,name:form.name,date:form.date,login_time:form.login_time||null,logout_time:form.logout_time||null,summary:form.summary||"",tasks:form.tasks||[],leave_type:form.leave_type||""}
-    const exists=reports.some(r=>r.id===form.id)
-    if(exists){await sb.from("reports").update(payload).eq("id",form.id)}
-    else{await sb.from("reports").insert(payload)}
-    if(!employees.includes(form.name)){await sb.from("employees").insert({name:form.name})}
-    showToast(exists?"Report updated ✓":"Report submitted! 🎉")
+  // Today: employees who marked attendance
+  const todayMarked=new Set(todayRecs.filter(r=>r.type==="attendance").map(r=>r.name))
+  const autoAbsent=isPastAbsentThreshold()
+  // After 11:30, unmarked employees are auto-absent
+  const notYet=employees.filter(e=>!todayMarked.has(e)&&!autoAbsent)
+  const autoAbsentList=employees.filter(e=>!todayMarked.has(e)&&autoAbsent)
+
+  // Monthly working days
+  const wdSoFar=useMemo(()=>workingDaysSoFar(selMonth),[selMonth])
+  const chartData=useMemo(()=>wdSoFar.slice(-10).map(d=>({
+    label:new Date(d+"T00:00:00").toLocaleDateString("en-IN",{day:"numeric",month:"short"}),
+    value:records.filter(r=>r.date===d&&r.type==="attendance"&&r.attendance==="present").length,
+    highlight:d===todayISOf
+  })),[records,wdSoFar,todayISOf])
+
+  // Group today's records by employee
+  const todayByEmp=useMemo(()=>{
+    // Include employees with records
+    const withRecs=[...new Set(todayRecs.map(r=>r.name))]
+    // Include auto-absent employees (past 11:30, no record)
+    const allNames=empFilter?[empFilter]:[...new Set([...withRecs,...(autoAbsent?employees.filter(e=>!todayMarked.has(e)):[])])].sort()
+    return allNames.map(name=>({
+      name,
+      recs:todayRecs.filter(r=>r.name===name),
+      autoAbsent:autoAbsent&&!todayMarked.has(name)
+    }))
+  },[todayRecs,empFilter,employees,todayMarked,autoAbsent])
+
+  // Group monthly records by date then employee
+  const monthGrouped=useMemo(()=>{
+    const filtered=empFilter?monthRecs.filter(r=>r.name===empFilter):monthRecs
+    const dates=[...new Set(filtered.map(r=>r.date))].sort((a,b)=>b.localeCompare(a))
+    return dates.map(date=>({
+      date,
+      employees:[...new Set(filtered.filter(r=>r.date===date).map(r=>r.name))].sort().map(name=>({
+        name, recs:filtered.filter(r=>r.date===date&&r.name===name)
+      }))
+    }))
+  },[monthRecs,empFilter])
+
+  async function saveRecord(rec){
+    const payload={
+      id:rec.id, name:rec.name, date:rec.date,
+      type:rec.type||"attendance",
+      attendance:rec.attendance||null,
+      login_time:rec.login_time||null,
+      logout_time:rec.logout_time||null,
+      summary:rec.summary||null,
+      task_name:rec.task_name||null,
+      start_time:rec.start_time||null,
+      end_time:rec.end_time||null,
+      status:rec.status||null,
+      tasks:rec.tasks||null,
+      leave_type:rec.leave_type||null,
+      sessions:rec.sessions||null
+    }
+    const exists=records.some(r=>r.id===rec.id)
+
+    // ── Optimistic update: update UI immediately, don't wait for realtime ──
+    if(exists){
+      setRecords(r=>r.map(x=>x.id===payload.id?{...x,...payload}:x))
+      await sb.from("reports").update(payload).eq("id",rec.id)
+    } else {
+      setRecords(r=>[payload,...r])
+      await sb.from("reports").insert(payload)
+    }
+    if(!employees.includes(rec.name)){await sb.from("employees").insert({name:rec.name})}
+    showToast(exists?"Updated ✓":"Saved ✓")
   }
-  async function saveLeave(lv){await sb.from("leaves").insert({id:lv.id,name:lv.name,date:lv.date,type:lv.type});showToast("Absence marked.")}
-  async function doDelete(){const rep=delTarget;setDelTarget(null);await sb.from("reports").delete().eq("id",rep.id);showToast("Report deleted.")}
-  async function quickCheckout(rep){const n=new Date(),t=`${pad(n.getHours())}:${pad(n.getMinutes())}`;await sb.from("reports").update({logout_time:t}).eq("id",rep.id);showToast(`Checked out at ${t} ✓`)}
-  async function addEmployee(){const name=newEmp.trim();if(!name)return;if(employees.includes(name)){showToast("Already on the list.","error");return}await sb.from("employees").insert({name});setNewEmp("");showToast(`${name} added.`)}
+
+  async function deleteRecord(rec){
+    // Optimistic remove
+    setRecords(r=>r.filter(x=>x.id!==rec.id))
+    await sb.from("reports").delete().eq("id",rec.id)
+    showToast("Deleted.")
+  }
+
+  async function addEmployee(){
+    const name=newEmp.trim();if(!name)return
+    if(employees.includes(name)){showToast("Already exists.","error");return}
+    await sb.from("employees").insert({name})
+    setNewEmp("");showToast(`${name} added.`)
+  }
   async function removeEmployee(name){await sb.from("employees").delete().eq("name",name);showToast(`${name} removed.`)}
   async function updatePin(){if(!newPin.trim())return;await sb.from("settings").update({value:newPin.trim()}).eq("key","admin_pin");setAdminPin(newPin.trim());setNewPin("");showToast("PIN updated ✓")}
 
-  const NAV=[{id:"today",label:"Today"},{id:"monthly",label:"Monthly"},{id:"dashboard",label:"Dashboard"},...(isAdmin?[{id:"manage",label:"Manage"}]:[])];
+  function exportCSV(){
+    const rows=[["Date","Employee","Type","Attendance","Login","Logout","Total Hours","Task","Start","End","Duration","Status"]]
+    ;[...records].sort((a,b)=>b.date.localeCompare(a.date)||a.name.localeCompare(b.name)).forEach(r=>{
+      if(r.type==="attendance"){rows.push([r.date,r.name,"attendance",r.attendance||"",r.login_time||"",r.logout_time||"",fmtDur(calcMins(r.login_time,r.logout_time)),"","","","",""])}
+      else if(r.type==="task"){rows.push([r.date,r.name,"task","","","","",`"${(r.task_name||"").replace(/"/g,'""')}"`,r.start_time||"",r.end_time||"",fmtDur(calcMins(r.start_time,r.end_time)),r.status||""])}
+    })
+    const a=document.createElement("a")
+    a.href=URL.createObjectURL(new Blob([rows.map(r=>r.join(",")).join("\n")],{type:"text/csv"}))
+    a.download=`teamtrack-${todayISO()}.csv`;a.click()
+  }
 
-  if(loading)return <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:G.canvas}}><div style={{textAlign:"center"}}><div style={{fontSize:14,color:C.muted}}>Loading TeamTrack…</div></div></div>
+  const NAV=[{id:"today",label:"Today"},{id:"monthly",label:"Monthly"},{id:"dashboard",label:"Dashboard"},...(isAdmin?[{id:"manage",label:"Manage"}]:[])]
 
+  if(loading)return <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:G.canvas}}><div style={{textAlign:"center"}}><div style={{width:40,height:40,borderRadius:10,background:G.brand,margin:"0 auto 12px",display:"flex",alignItems:"center",justifyContent:"center"}}><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div><div style={{fontSize:14,color:C.muted}}>Loading TeamTrack…</div></div></div>
+
+  // ── LOGIN ──
   if(!user)return(
     <div style={{minHeight:"100vh",background:G.canvas,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24}}>
       <div style={{background:C.white,borderRadius:22,boxShadow:"0 24px 64px rgba(79,70,229,0.13)",padding:"44px 40px 36px",width:"100%",maxWidth:420}}>
         <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:28}}>
-          <div style={{width:48,height:48,borderRadius:13,background:G.brand,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.2" strokeLinecap="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
-          </div>
-          <div><h1 style={{margin:0,fontSize:24,fontWeight:800,color:"#1E1B4B",letterSpacing:"-0.5px"}}>TeamTrack</h1><p style={{margin:0,fontSize:12,color:C.faint}}>Daily work · Attendance · Reports</p></div>
+          <div style={{width:48,height:48,borderRadius:13,background:G.brand,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.2" strokeLinecap="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></div>
+          <div><h1 style={{margin:0,fontSize:24,fontWeight:800,color:"#1E1B4B",letterSpacing:"-0.5px"}}>TeamTrack</h1><p style={{margin:0,fontSize:12,color:C.faint}}>Daily work · Attendance · Task tracking</p></div>
         </div>
-        <label style={LBL}>Select your name to continue</label>
+        <label style={LBL}>Select your name</label>
         {employees.length===0
-          ?<div style={{padding:"18px",background:C.surface,borderRadius:10,fontSize:13,color:C.muted,textAlign:"center",marginBottom:16}}>No employees yet.<br/>Ask your admin to add names first.</div>
+          ?<div style={{padding:"18px",background:C.surface,borderRadius:10,fontSize:13,color:C.muted,textAlign:"center",marginBottom:16}}>No employees yet.<br/>Ask admin to add you first.</div>
           :<select defaultValue="" onChange={e=>{if(e.target.value)setUser(e.target.value)}} style={{...INP,marginBottom:20,fontSize:15,appearance:"none"}}>
             <option value="" disabled>— choose your name —</option>
             {employees.map(e=><option key={e} value={e}>{e}</option>)}
           </select>
         }
-        <div style={{borderTop:`1px dashed ${C.line}`,paddingTop:16,textAlign:"center"}}><button type="button" onClick={()=>{setPinInput("");setPinErr("");setPinOpen(true)}} style={{background:"none",border:"none",color:C.primary,cursor:"pointer",fontSize:13,fontWeight:600}}>Admin login →</button></div>
+        <div style={{borderTop:`1px dashed ${C.line}`,paddingTop:16,textAlign:"center"}}>
+          <button type="button" onClick={()=>{setPinInput("");setPinErr("");setPinOpen(true)}} style={{background:"none",border:"none",color:C.primary,cursor:"pointer",fontSize:13,fontWeight:600}}>Admin login →</button>
+        </div>
       </div>
       <Modal open={pinOpen} onClose={()=>setPinOpen(false)} width={340}>
-        <div style={{padding:"24px 26px"}}><h3 style={{margin:"0 0 4px",fontSize:17,fontWeight:700,color:C.ink}}>Admin access</h3><p style={{margin:"0 0 16px",fontSize:13,color:C.muted}}>Enter your admin PIN.</p><input type="password" value={pinInput} onChange={e=>setPinInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"){if(pinInput===adminPin){setAdmin(true);setUser("Admin");setPinOpen(false)}else setPinErr("Incorrect PIN.")}}} placeholder="Admin PIN" style={{...INP,marginBottom:6}} autoFocus/>{pinErr&&<p style={{color:C.danger,fontSize:12,margin:"0 0 10px",fontWeight:600}}>{pinErr}</p>}<div style={{display:"flex",gap:9,marginTop:14}}><button type="button" onClick={()=>setPinOpen(false)} style={{flex:1,padding:"10px",border:`1.5px solid ${C.line}`,borderRadius:9,background:"none",cursor:"pointer",fontSize:14,fontFamily:"inherit",color:C.muted}}>Cancel</button><button type="button" onClick={()=>{if(pinInput===adminPin){setAdmin(true);setUser("Admin");setPinOpen(false)}else setPinErr("Incorrect PIN.")}} style={{flex:1,padding:"10px",border:"none",borderRadius:9,background:G.brand,color:C.white,cursor:"pointer",fontSize:14,fontWeight:700,fontFamily:"inherit"}}>Sign in</button></div></div>
+        <div style={{padding:"24px 26px"}}>
+          <h3 style={{margin:"0 0 4px",fontSize:17,fontWeight:700,color:C.ink}}>Admin access</h3>
+          <p style={{margin:"0 0 16px",fontSize:13,color:C.muted}}>Enter admin PIN to continue.</p>
+          <input type="password" value={pinInput} onChange={e=>setPinInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"){if(pinInput===adminPin){setAdmin(true);setUser("Admin");setPinOpen(false)}else setPinErr("Incorrect PIN.")}}} placeholder="Admin PIN" style={{...INP,marginBottom:6}} autoFocus/>
+          {pinErr&&<p style={{color:C.danger,fontSize:12,margin:"0 0 10px",fontWeight:600}}>{pinErr}</p>}
+          <div style={{display:"flex",gap:9,marginTop:14}}>
+            <button type="button" onClick={()=>setPinOpen(false)} style={{flex:1,padding:"10px",border:`1.5px solid ${C.line}`,borderRadius:9,background:"none",cursor:"pointer",fontSize:14,fontFamily:"inherit",color:C.muted}}>Cancel</button>
+            <button type="button" onClick={()=>{if(pinInput===adminPin){setAdmin(true);setUser("Admin");setPinOpen(false)}else setPinErr("Incorrect PIN.")}} style={{flex:1,padding:"10px",border:"none",borderRadius:9,background:G.brand,color:C.white,cursor:"pointer",fontSize:14,fontWeight:700,fontFamily:"inherit"}}>Sign in</button>
+          </div>
+        </div>
       </Modal>
     </div>
   )
 
-  if(!isAdmin)return(
-    <div style={{minHeight:"100vh",background:G.canvas}}>
-      <div style={{background:C.white,borderBottom:`1px solid ${C.line}`,position:"sticky",top:0,zIndex:50}}>
-        <div style={{maxWidth:720,margin:"0 auto",padding:"0 20px",display:"flex",alignItems:"center",gap:10,height:56}}>
-          <div style={{width:28,height:28,borderRadius:7,background:G.brand,display:"flex",alignItems:"center",justifyContent:"center"}}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div>
-          <span style={{fontWeight:800,fontSize:14,color:"#1E1B4B"}}>TeamTrack</span>
-          <div style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:9}}>
-            <div style={{display:"flex",alignItems:"center",gap:8,padding:"5px 12px",background:G.soft,borderRadius:99}}><Avatar name={user} size={22}/><span style={{fontSize:13,fontWeight:600,color:C.primary}}>{user}</span></div>
-            <button type="button" onClick={()=>{setUser(null);setAdmin(false)}} style={{background:"none",border:`1.5px solid ${C.line}`,borderRadius:8,padding:"5px 11px",cursor:"pointer",fontSize:12,color:C.faint,fontFamily:"inherit"}}>Log out</button>
-          </div>
-        </div>
-      </div>
-      <div style={{maxWidth:720,margin:"0 auto",padding:"28px 20px 80px"}}>
-        <div style={{background:G.brand,borderRadius:18,padding:"28px 28px 24px",marginBottom:20,color:C.white}}>
-          <div style={{fontSize:13,opacity:.8,marginBottom:4}}>{fmtDate(todayISOf,{weekday:"long",day:"numeric",month:"long",year:"numeric"})}</div>
-          <h2 style={{margin:"0 0 16px",fontSize:22,fontWeight:800,letterSpacing:"-0.4px"}}>Good {new Date().getHours()<12?"morning":new Date().getHours()<17?"afternoon":"evening"}, {user.split(" ")[0]} 👋</h2>
-          {myToday
-            ?myToday.logout_time
-              ?<div style={{background:"rgba(255,255,255,0.15)",borderRadius:10,padding:"12px 16px",fontSize:14}}>✅ Report submitted. <strong>{fmtDur(calcMins(myToday.login_time,myToday.logout_time))}</strong> logged today.</div>
-              :<div style={{display:"flex",gap:10,flexWrap:"wrap"}}><div style={{background:"rgba(255,255,255,0.15)",borderRadius:10,padding:"12px 16px",fontSize:14,flex:1}}>⏱ Logged in at <strong>{myToday.login_time}</strong></div><button type="button" onClick={()=>quickCheckout(myToday)} style={{border:"none",borderRadius:10,padding:"12px 18px",background:C.white,color:C.primary,cursor:"pointer",fontSize:14,fontWeight:700,fontFamily:"inherit"}}>Check out now</button></div>
-            :<button type="button" onClick={()=>{setEditRep(null);setFormOpen(true)}} style={{border:"none",borderRadius:10,padding:"13px 22px",background:C.white,color:C.primary,cursor:"pointer",fontSize:15,fontWeight:800,fontFamily:"inherit",display:"flex",alignItems:"center",gap:8}}><span style={{fontSize:18}}>+</span>Log today's work</button>
-          }
-        </div>
-        {(()=>{
-          const myM=reports.filter(r=>r.name===user&&mk(r.date)===mk(todayISOf)&&!r.leave_type&&r.login_time)
-          const wd=workingDaysSoFar(mk(todayISOf)),myL=leaves.filter(l=>l.name===user&&mk(l.date)===mk(todayISOf))
-          const att=wd.length?Math.round(((myM.length+myL.length)/wd.length)*100):0
-          const allT=myM.flatMap(r=>r.tasks||[]),tPct=allT.length?Math.round((allT.filter(t=>t.status==="done").length/allT.length)*100):null
-          const avgM=myM.length?Math.round(myM.reduce((s,r)=>s+calcMins(r.login_time,r.logout_time),0)/myM.length):0
-          return <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,marginBottom:22}}>{[{label:"Attendance this month",value:`${att}%`,color:C.primary},{label:"Avg hours / day",value:fmtDur(avgM)||"—",color:C.success},{label:"Tasks done",value:tPct!==null?`${tPct}%`:"—",color:C.warning}].map(s=><div key={s.label} style={{background:C.white,border:`1px solid ${C.line}`,borderRadius:12,padding:"14px 16px"}}><div style={{fontSize:22,fontWeight:800,color:s.color}}>{s.value}</div><div style={{fontSize:11,color:C.faint,marginTop:2}}>{s.label}</div></div>)}</div>
-        })()}
-        <div style={{marginBottom:12,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-          <h3 style={{margin:0,fontSize:15,fontWeight:700,color:C.ink}}>Your recent reports</h3>
-          {myToday&&<button type="button" onClick={()=>{setEditRep(myToday);setFormOpen(true)}} style={{background:"none",border:`1.5px solid ${C.line}`,borderRadius:8,padding:"5px 12px",cursor:"pointer",fontSize:12,color:C.muted,fontFamily:"inherit"}}>Edit today's</button>}
-        </div>
-        {myReps.length===0
-          ?<div style={{textAlign:"center",padding:"48px 20px",background:C.white,borderRadius:13,border:`1px solid ${C.line}`,color:C.faint}}><div style={{fontSize:32,marginBottom:8}}>📋</div><div style={{fontSize:14,fontWeight:600,color:C.muted}}>No reports yet</div></div>
-          :<div style={{display:"flex",flexDirection:"column",gap:10}}>{myReps.slice(0,7).map(r=><ReportCard key={r.id} report={r} canEdit={true} isAdmin={false} onEdit={rep=>{setEditRep(rep);setFormOpen(true)}} onDelete={()=>{}} onCheckout={quickCheckout} compact/>)}</div>
-        }
-      </div>
-      <ReportForm open={formOpen} onClose={()=>{setFormOpen(false);setEditRep(null)}} onSave={saveReport} existing={editRep} currentUser={user} prevTasks={prevTasks}/>
-      <Toast msg={toast.msg} type={toast.type}/>
-    </div>
-  )
+  // ── EMPLOYEE VIEW ──
+  if(!isAdmin)return <EmpDashboard user={user} records={records} onSave={saveRecord} onDelete={deleteRecord} showToast={showToast} onLogout={()=>{setUser(null)}}/>
 
-  const todayFiltered=empFilter?todayReps.filter(r=>r.name===empFilter):todayReps
+  // ── ADMIN VIEW ──
   return(
     <div style={{minHeight:"100vh",background:C.surface}}>
       <div style={{background:C.white,borderBottom:`1px solid ${C.line}`,position:"sticky",top:0,zIndex:50}}>
-        <div style={{maxWidth:980,margin:"0 auto",padding:"0 20px",display:"flex",alignItems:"center",gap:8,height:56}}>
+        <div style={{maxWidth:1000,margin:"0 auto",padding:"0 20px",display:"flex",alignItems:"center",gap:8,height:56}}>
           <div style={{width:28,height:28,borderRadius:7,background:G.brand,display:"flex",alignItems:"center",justifyContent:"center"}}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div>
           <span style={{fontWeight:800,fontSize:14,color:"#1E1B4B"}}>TeamTrack</span>
           <nav style={{display:"flex",gap:1,marginLeft:14}}>{NAV.map(n=><button key={n.id} type="button" onClick={()=>setView(n.id)} style={{padding:"6px 13px",border:"none",borderRadius:8,cursor:"pointer",fontSize:12.5,fontWeight:view===n.id?700:500,background:view===n.id?"#EEF2FF":"none",color:view===n.id?C.primary:C.muted,fontFamily:"inherit"}}>{n.label}</button>)}</nav>
           <div style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:8}}>
-            <button type="button" onClick={()=>exportCSV(reports,leaves)} style={{padding:"6px 12px",border:`1.5px solid ${C.line}`,borderRadius:8,background:"none",cursor:"pointer",fontSize:12,color:C.muted,fontFamily:"inherit"}}>Export CSV</button>
-            <div style={{display:"flex",alignItems:"center",gap:7,padding:"4px 11px",background:G.soft,borderRadius:99}}><span style={{fontSize:10,background:G.brand,color:C.white,padding:"1px 7px",borderRadius:99,fontWeight:700}}>ADMIN</span></div>
+            <button type="button" onClick={exportCSV} style={{padding:"6px 12px",border:`1.5px solid ${C.line}`,borderRadius:8,background:"none",cursor:"pointer",fontSize:12,color:C.muted,fontFamily:"inherit"}}>Export CSV</button>
+            <div style={{background:G.soft,padding:"4px 11px",borderRadius:99,display:"flex",alignItems:"center",gap:6}}><span style={{fontSize:10,background:G.brand,color:C.white,padding:"1px 7px",borderRadius:99,fontWeight:700}}>ADMIN</span></div>
             <button type="button" onClick={()=>{setUser(null);setAdmin(false);setView("today")}} style={{background:"none",border:`1.5px solid ${C.line}`,borderRadius:8,padding:"5px 10px",cursor:"pointer",fontSize:12,color:C.faint,fontFamily:"inherit"}}>Log out</button>
           </div>
         </div>
       </div>
-      <div style={{maxWidth:980,margin:"0 auto",padding:"24px 20px 80px"}}>
+
+      <div style={{maxWidth:1000,margin:"0 auto",padding:"24px 20px 80px"}}>
+
+        {/* TODAY */}
         {view==="today"&&<>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:10,marginBottom:18}}>{[{label:"Checked in",value:todayReps.filter(r=>!r.leave_type).length,color:C.primary},{label:"Still in office",value:todayReps.filter(r=>!r.logout_time&&!r.leave_type).length,color:C.success},{label:"Late today",value:todayReps.filter(r=>isLate(r.login_time)&&!r.leave_type).length,color:C.danger},{label:"On leave/WFH",value:todayLv.size,color:C.warning},{label:"Not logged yet",value:notYet.length,color:C.faint}].map(s=><div key={s.label} style={{background:C.white,border:`1px solid ${C.line}`,borderRadius:11,padding:"13px 14px"}}><div style={{fontSize:24,fontWeight:800,color:s.color}}>{s.value}</div><div style={{fontSize:11,color:C.faint,marginTop:1}}>{s.label}</div></div>)}</div>
-          {notYet.length>0&&<div style={{background:"#FFFBEB",border:"1px solid #FDE68A",borderRadius:10,padding:"10px 16px",marginBottom:16,display:"flex",alignItems:"center",flexWrap:"wrap",gap:7}}><span style={{fontSize:12,fontWeight:700,color:"#92400E"}}>⏳ Pending:</span>{notYet.map(n=><span key={n} style={{fontSize:12,background:"#FEF9C3",color:"#92400E",padding:"2px 9px",borderRadius:99,fontWeight:600}}>{n}</span>)}</div>}
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}}>
-            <div style={{display:"flex",gap:8,alignItems:"center"}}>
-              <h2 style={{margin:0,fontSize:16,fontWeight:700,color:C.ink}}>{fmtDate(todayISOf,{weekday:"long",day:"numeric",month:"long"})}</h2>
-              <select value={empFilter} onChange={e=>setEmpFilter(e.target.value)} style={{padding:"5px 10px",border:`1.5px solid ${C.line}`,borderRadius:8,fontSize:12,fontFamily:"inherit",outline:"none",color:C.muted}}><option value="">All employees</option>{employees.map(e=><option key={e} value={e}>{e}</option>)}</select>
-            </div>
-            <div style={{display:"flex",gap:8}}>
-              <button type="button" onClick={()=>setLeaveOpen(true)} style={{padding:"8px 15px",border:`1.5px solid ${C.line}`,borderRadius:9,background:C.white,cursor:"pointer",fontSize:13,color:C.muted,fontFamily:"inherit"}}>Mark absence</button>
-              <button type="button" onClick={()=>{setEditRep(null);setFormOpen(true)}} style={{padding:"8px 18px",border:"none",borderRadius:9,background:G.brand,color:C.white,cursor:"pointer",fontSize:13,fontWeight:700,fontFamily:"inherit"}}>+ Log work</button>
-            </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:10,marginBottom:18}}>
+            {[
+              {label:"Present",value:todayRecs.filter(r=>r.type==="attendance"&&r.attendance==="present").length,color:C.success},
+              {label:"Late",value:todayRecs.filter(r=>r.type==="attendance"&&isLate(r.login_time)).length,color:C.danger},
+              {label:"Leave/WFH",value:todayRecs.filter(r=>r.type==="attendance"&&["leave","sick","wfh","halfday"].includes(r.attendance)).length,color:C.warning},
+              {label:"Absent",value:todayRecs.filter(r=>r.type==="attendance"&&r.attendance==="absent").length+autoAbsentList.length,color:C.danger},
+              {label:"Not marked",value:notYet.length,color:"#CBD5E1"},
+            ].map(s=><div key={s.label} style={{background:C.white,border:`1px solid ${C.line}`,borderRadius:11,padding:"13px 14px"}}><div style={{fontSize:24,fontWeight:800,color:s.color}}>{s.value}</div><div style={{fontSize:11,color:C.faint,marginTop:1}}>{s.label}</div></div>)}
           </div>
-          {todayFiltered.length===0?<div style={{textAlign:"center",padding:"56px 20px",color:C.faint,background:C.white,borderRadius:13,border:`1px solid ${C.line}`}}><div style={{fontSize:32,marginBottom:8}}>📋</div><div style={{fontSize:15,fontWeight:600,color:C.muted}}>No reports yet today</div></div>:<div style={{display:"flex",flexDirection:"column",gap:10}}>{todayFiltered.map(r=><ReportCard key={r.id} report={r} canEdit={false} isAdmin={true} onEdit={rep=>{setEditRep(rep);setFormOpen(true)}} onDelete={setDelTarget} onCheckout={quickCheckout}/>)}</div>}
+
+          {notYet.length>0&&<div style={{background:"#FFFBEB",border:"1px solid #FDE68A",borderRadius:10,padding:"10px 16px",marginBottom:12,display:"flex",alignItems:"center",flexWrap:"wrap",gap:7}}>
+            <span style={{fontSize:12,fontWeight:700,color:"#92400E"}}>⏳ Not marked yet:</span>
+            {notYet.map(n=><span key={n} style={{fontSize:12,background:"#FEF9C3",color:"#92400E",padding:"2px 9px",borderRadius:99,fontWeight:600}}>{n}</span>)}
+          </div>}
+          {autoAbsentList.length>0&&<div style={{background:"#FEF2F2",border:"1px solid #FECACA",borderRadius:10,padding:"10px 16px",marginBottom:12,display:"flex",alignItems:"center",flexWrap:"wrap",gap:7}}>
+            <span style={{fontSize:12,fontWeight:700,color:C.danger}}>🔴 Auto-marked absent (past 11:30 AM):</span>
+            {autoAbsentList.map(n=><span key={n} style={{fontSize:12,background:"#FEE2E2",color:C.danger,padding:"2px 9px",borderRadius:99,fontWeight:600}}>{n}</span>)}
+            <span style={{fontSize:11,color:C.faint,marginLeft:"auto"}}>Admin can override</span>
+          </div>}
+
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}}>
+            <h2 style={{margin:0,fontSize:16,fontWeight:700,color:C.ink}}>{fmtDate(todayISOf,{weekday:"long",day:"numeric",month:"long"})}</h2>
+            <select value={empFilter} onChange={e=>setEmpFilter(e.target.value)} style={{padding:"6px 11px",border:`1.5px solid ${C.line}`,borderRadius:8,fontSize:12,fontFamily:"inherit",outline:"none",color:C.muted}}>
+              <option value="">All employees</option>{employees.map(e=><option key={e} value={e}>{e}</option>)}
+            </select>
+          </div>
+
+          {todayByEmp.length===0
+            ?<div style={{textAlign:"center",padding:"56px 20px",background:C.white,borderRadius:13,border:`1px solid ${C.line}`,color:C.faint}}><div style={{fontSize:32,marginBottom:8}}>📋</div><div style={{fontSize:15,fontWeight:600,color:C.muted}}>No reports yet today</div></div>
+            :<div style={{display:"flex",flexDirection:"column",gap:12}}>{todayByEmp.map(({name,recs,autoAbsent:isAutoAbsent})=><AdminEmployeeDay key={name} name={name} date={todayISOf} records={recs} onSave={saveRecord} onDelete={deleteRecord} employees={employees} autoAbsent={isAutoAbsent}/>)}</div>
+          }
         </>}
+
+        {/* MONTHLY */}
         {view==="monthly"&&<>
-          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:18,flexWrap:"wrap"}}>
+          <div style={{display:"flex",gap:10,marginBottom:18,flexWrap:"wrap",alignItems:"center"}}>
             <select value={selMonth} onChange={e=>setSelMonth(e.target.value)} style={{padding:"8px 13px",border:`1.5px solid ${C.line}`,borderRadius:9,fontSize:14,fontFamily:"inherit",outline:"none",background:C.white,color:C.ink,fontWeight:700}}>{months.map(m=><option key={m} value={m}>{fmtMonth(m)}</option>)}</select>
-            <select value={empFilter} onChange={e=>setEmpFilter(e.target.value)} style={{padding:"8px 13px",border:`1.5px solid ${C.line}`,borderRadius:9,fontSize:13,fontFamily:"inherit",outline:"none",background:C.white,color:C.muted}}><option value="">All employees</option>{employees.map(e=><option key={e} value={e}>{e}</option>)}</select>
+            <select value={empFilter} onChange={e=>setEmpFilter(e.target.value)} style={{padding:"8px 13px",border:`1.5px solid ${C.line}`,borderRadius:9,fontSize:13,fontFamily:"inherit",outline:"none",background:C.white,color:C.muted}}>
+              <option value="">All employees</option>{employees.map(e=><option key={e} value={e}>{e}</option>)}
+            </select>
             {empFilter&&<button type="button" onClick={()=>setEmpFilter("")} style={{background:"none",border:"none",color:C.primary,cursor:"pointer",fontSize:13,fontWeight:600}}>Clear ×</button>}
           </div>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:10,marginBottom:22}}>{[{label:"Total reports",value:monthReps.length,color:C.primary},{label:"Employees active",value:new Set(monthReps.map(r=>r.name)).size,color:C.success},{label:"Working days",value:new Set(monthReps.map(r=>r.date)).size,color:"#7C3AED"},{label:"Late arrivals",value:monthReps.filter(r=>isLate(r.login_time)&&!r.leave_type).length,color:C.danger},{label:"Leaves / WFH",value:monthLvs.length,color:C.warning}].map(s=><div key={s.label} style={{background:C.white,border:`1px solid ${C.line}`,borderRadius:11,padding:"13px 14px"}}><div style={{fontSize:24,fontWeight:800,color:s.color}}>{s.value}</div><div style={{fontSize:11,color:C.faint,marginTop:1}}>{s.label}</div></div>)}</div>
-          {grouped.length===0?<div style={{textAlign:"center",padding:"56px 20px",color:C.faint,background:C.white,borderRadius:13,border:`1px solid ${C.line}`}}><div style={{fontSize:32,marginBottom:8}}>📅</div><div style={{fontSize:15,fontWeight:600,color:C.muted}}>No reports for {fmtMonth(selMonth)}</div></div>:grouped.map(([date,reps])=><div key={date} style={{marginBottom:22}}><div style={{fontSize:11,fontWeight:700,color:C.faint,textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:8,paddingBottom:7,borderBottom:`1px solid ${C.line}`,display:"flex",alignItems:"center",gap:8}}>{fmtDate(date,{weekday:"long",day:"numeric",month:"short"})} <span style={{fontWeight:400}}>· {reps.length} report{reps.length!==1?"s":""}</span>{reps.filter(r=>isLate(r.login_time)&&!r.leave_type).length>0&&<span style={{fontSize:11,background:"#FEF2F2",color:C.danger,padding:"1px 8px",borderRadius:99,fontWeight:700}}>{reps.filter(r=>isLate(r.login_time)&&!r.leave_type).length} late</span>}</div><div style={{display:"flex",flexDirection:"column",gap:9}}>{reps.map(r=><ReportCard key={r.id} report={r} canEdit={false} isAdmin={true} onEdit={rep=>{setEditRep(rep);setFormOpen(true)}} onDelete={setDelTarget} onCheckout={quickCheckout}/>)}</div></div>)}
+
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:22}}>
+            {[
+              {label:"Present days",value:monthRecs.filter(r=>r.type==="attendance"&&r.attendance==="present").length,color:C.success},
+              {label:"Late arrivals",value:monthRecs.filter(r=>r.type==="attendance"&&isLate(r.login_time)).length,color:C.danger},
+              {label:"Tasks completed",value:monthRecs.filter(r=>r.type==="task"&&r.status==="done").length,color:C.primary},
+              {label:"Leave/WFH days",value:monthRecs.filter(r=>r.type==="attendance"&&["leave","sick","wfh","halfday"].includes(r.attendance)).length,color:C.warning},
+            ].map(s=><div key={s.label} style={{background:C.white,border:`1px solid ${C.line}`,borderRadius:11,padding:"13px 14px"}}><div style={{fontSize:24,fontWeight:800,color:s.color}}>{s.value}</div><div style={{fontSize:11,color:C.faint,marginTop:1}}>{s.label}</div></div>)}
+          </div>
+
+          {monthGrouped.length===0
+            ?<div style={{textAlign:"center",padding:"56px 20px",background:C.white,borderRadius:13,border:`1px solid ${C.line}`,color:C.faint}}><div style={{fontSize:32,marginBottom:8}}>📅</div><div style={{fontSize:15,fontWeight:600,color:C.muted}}>No data for {fmtMonth(selMonth)}</div></div>
+            :monthGrouped.map(({date,employees:emps})=><div key={date} style={{marginBottom:24}}>
+              <div style={{fontSize:11,fontWeight:700,color:C.faint,textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:10,paddingBottom:7,borderBottom:`1px solid ${C.line}`}}>
+                {fmtDate(date,{weekday:"long",day:"numeric",month:"long"})} · {emps.length} report{emps.length!==1?"s":""}
+              </div>
+              <div style={{display:"flex",flexDirection:"column",gap:10}}>{emps.map(({name,recs})=><AdminEmployeeDay key={name} name={name} date={date} records={recs} onSave={saveRecord} onDelete={deleteRecord} employees={employees}/>)}</div>
+            </div>)
+          }
         </>}
+
+        {/* DASHBOARD */}
         {view==="dashboard"&&<>
-          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:20,flexWrap:"wrap"}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:20}}>
             <h2 style={{margin:0,fontSize:18,fontWeight:700,color:C.ink}}>Team Dashboard</h2>
             <select value={selMonth} onChange={e=>setSelMonth(e.target.value)} style={{marginLeft:"auto",padding:"7px 12px",border:`1.5px solid ${C.line}`,borderRadius:9,fontSize:13,fontFamily:"inherit",outline:"none",background:C.white,color:C.ink,fontWeight:700}}>{months.map(m=><option key={m} value={m}>{fmtMonth(m)}</option>)}</select>
           </div>
-          <div style={{background:C.white,border:`1px solid ${C.line}`,borderRadius:14,padding:"20px 22px",marginBottom:14}}><div style={{fontSize:13,fontWeight:700,color:C.muted,marginBottom:14}}>Daily check-ins — last 10 working days</div><BarChart data={chartData}/></div>
+          <div style={{background:C.white,border:`1px solid ${C.line}`,borderRadius:14,padding:"20px 22px",marginBottom:14}}>
+            <div style={{fontSize:13,fontWeight:700,color:C.muted,marginBottom:14}}>Daily attendance — last 10 working days</div>
+            <BarChart data={chartData}/>
+          </div>
           <div style={{background:C.white,border:`1px solid ${C.line}`,borderRadius:14,overflow:"hidden"}}>
-            <div style={{padding:"15px 20px",borderBottom:`1px solid ${C.line}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}><div style={{fontSize:15,fontWeight:700,color:C.ink}}>Employee breakdown · {fmtMonth(selMonth)}</div><div style={{fontSize:12,color:C.faint}}>{wdSoFar.length} working days so far</div></div>
-            {employees.length===0?<div style={{padding:"40px",textAlign:"center",color:C.faint,fontSize:14}}>No employees yet.</div>:employees.map(name=><EmpRow key={name} name={name} reps={monthReps.filter(r=>r.name===name)} lvs={monthLvs.filter(l=>l.name===name)} wdCount={wdSoFar.length}/>)}
+            <div style={{padding:"15px 20px",borderBottom:`1px solid ${C.line}`,display:"flex",justifyContent:"space-between"}}>
+              <div style={{fontSize:15,fontWeight:700,color:C.ink}}>Employee breakdown · {fmtMonth(selMonth)}</div>
+              <div style={{fontSize:12,color:C.faint}}>{wdSoFar.length} working days</div>
+            </div>
+            {employees.length===0?<div style={{padding:"40px",textAlign:"center",color:C.faint}}>No employees yet.</div>:employees.map(name=>{
+              const reps=monthRecs.filter(r=>r.name===name&&r.type==="attendance")
+              const tasks=monthRecs.filter(r=>r.name===name&&r.type==="task")
+              const present=reps.filter(r=>r.attendance==="present").length
+              const late=reps.filter(r=>isLate(r.login_time)).length
+              const doneTasks=tasks.filter(t=>t.status==="done").length
+              const tPct=tasks.length?Math.round((doneTasks/tasks.length)*100):null
+              const attPct=wdSoFar.length?Math.round((present/wdSoFar.length)*100):0
+              const totalMins=reps.reduce((s,r)=>s+calcMins(r.login_time,r.logout_time),0)
+              const avgMins=present?Math.round(totalMins/present):0
+              const taskMins=tasks.reduce((s,t)=>s+calcMins(t.start_time,t.end_time),0)
+              return <div key={name} style={{padding:"14px 20px",borderBottom:`1px solid ${C.surface}`,display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}>
+                <Avatar name={name} size={40}/>
+                <div style={{flex:1,minWidth:120}}>
+                  <div style={{fontWeight:700,fontSize:14,color:C.ink}}>{name}</div>
+                  <div style={{fontSize:12,color:C.faint,marginTop:2}}>
+                    {present}d present · {late>0&&<span style={{color:C.danger}}>{late} late · </span>}avg {fmtDur(avgMins)}/day · tasks: {fmtDur(taskMins)}
+                  </div>
+                  {late>2&&<div style={{marginTop:5,background:"#FEF2F2",borderRadius:6,padding:"3px 8px",fontSize:11,color:C.danger,fontWeight:600,display:"inline-block"}}>⚠ Late {late}× this month</div>}
+                </div>
+                <div style={{display:"flex",gap:12,alignItems:"center"}}>
+                  <Donut pct={attPct} color={C.primary} size={52} label="Attendance"/>
+                  {tPct!==null&&<Donut pct={tPct} color={C.success} size={52} label="Tasks done"/>}
+                </div>
+              </div>
+            })}
           </div>
         </>}
+
+        {/* MANAGE */}
         {view==="manage"&&<>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:18}}>
-            <div style={{background:C.white,border:`1px solid ${C.line}`,borderRadius:14,padding:"22px"}}><h3 style={{margin:"0 0 14px",fontSize:15,fontWeight:700,color:C.ink}}>Add employee</h3><div style={{display:"flex",gap:9}}><input value={newEmp} onChange={e=>setNewEmp(e.target.value)} onKeyDown={e=>{if(e.key==="Enter")addEmployee()}} placeholder="Full name" style={{...INP,flex:1}}/><button type="button" onClick={addEmployee} style={{padding:"9px 18px",border:"none",borderRadius:9,background:G.brand,color:C.white,cursor:"pointer",fontSize:14,fontWeight:700,fontFamily:"inherit",whiteSpace:"nowrap"}}>Add</button></div></div>
-            <div style={{background:C.white,border:`1px solid ${C.line}`,borderRadius:14,padding:"22px"}}><h3 style={{margin:"0 0 14px",fontSize:15,fontWeight:700,color:C.ink}}>Change admin PIN</h3><div style={{display:"flex",gap:9}}><input type="password" value={newPin} onChange={e=>setNewPin(e.target.value)} placeholder="New PIN" style={{...INP,flex:1}}/><button type="button" onClick={updatePin} style={{padding:"9px 18px",border:"none",borderRadius:9,background:G.brand,color:C.white,cursor:"pointer",fontSize:14,fontWeight:700,fontFamily:"inherit"}}>Update</button></div></div>
+            <div style={{background:C.white,border:`1px solid ${C.line}`,borderRadius:14,padding:"22px"}}>
+              <h3 style={{margin:"0 0 14px",fontSize:15,fontWeight:700,color:C.ink}}>Add employee</h3>
+              <div style={{display:"flex",gap:9}}><input value={newEmp} onChange={e=>setNewEmp(e.target.value)} onKeyDown={e=>{if(e.key==="Enter")addEmployee()}} placeholder="Full name" style={{...INP,flex:1}}/><button type="button" onClick={addEmployee} style={{padding:"9px 18px",border:"none",borderRadius:9,background:G.brand,color:C.white,cursor:"pointer",fontSize:14,fontWeight:700,fontFamily:"inherit",whiteSpace:"nowrap"}}>Add</button></div>
+            </div>
+            <div style={{background:C.white,border:`1px solid ${C.line}`,borderRadius:14,padding:"22px"}}>
+              <h3 style={{margin:"0 0 14px",fontSize:15,fontWeight:700,color:C.ink}}>Change admin PIN</h3>
+              <div style={{display:"flex",gap:9}}><input type="password" value={newPin} onChange={e=>setNewPin(e.target.value)} placeholder="New PIN" style={{...INP,flex:1}}/><button type="button" onClick={updatePin} style={{padding:"9px 18px",border:"none",borderRadius:9,background:G.brand,color:C.white,cursor:"pointer",fontSize:14,fontWeight:700,fontFamily:"inherit"}}>Update</button></div>
+            </div>
           </div>
+
           <div style={{background:C.white,border:`1px solid ${C.line}`,borderRadius:14,overflow:"hidden",marginBottom:16}}>
-            <div style={{padding:"15px 22px",borderBottom:`1px solid ${C.line}`}}><h3 style={{margin:0,fontSize:15,fontWeight:700,color:C.ink}}>Team · {employees.length} member{employees.length!==1?"s":""}</h3></div>
-            {employees.length===0?<div style={{padding:"40px",textAlign:"center",color:C.faint,fontSize:14}}>No employees yet.</div>:employees.map((name,i)=>{const last=reports.filter(r=>r.name===name).sort((a,b)=>b.date.localeCompare(a.date))[0];return <div key={name} style={{display:"flex",alignItems:"center",gap:13,padding:"13px 22px",borderTop:i===0?"none":`1px solid ${C.surface}`}}><Avatar name={name} size={36}/><div style={{flex:1}}><div style={{fontWeight:600,fontSize:14,color:C.ink}}>{name}</div><div style={{fontSize:12,color:C.faint}}>{last?`Last: ${fmtDate(last.date)}`:"No reports yet"} · {reports.filter(r=>r.name===name).length} total</div></div><button type="button" onClick={()=>removeEmployee(name)} style={{background:"none",border:"1px solid #FECACA",borderRadius:7,padding:"5px 12px",cursor:"pointer",fontSize:12,color:C.danger,fontFamily:"inherit"}}>Remove</button></div>})}
+            <div style={{padding:"15px 22px",borderBottom:`1px solid ${C.line}`}}><h3 style={{margin:0,fontSize:15,fontWeight:700,color:C.ink}}>Team · {employees.length} members</h3></div>
+            {employees.length===0?<div style={{padding:"40px",textAlign:"center",color:C.faint,fontSize:14}}>No employees yet.</div>:employees.map((name,i)=>{
+              const last=records.filter(r=>r.name===name&&r.type==="attendance").sort((a,b)=>b.date.localeCompare(a.date))[0]
+              const totalRecs=records.filter(r=>r.name===name)
+              return <div key={name} style={{display:"flex",alignItems:"center",gap:13,padding:"13px 22px",borderTop:i===0?"none":`1px solid ${C.surface}`}}>
+                <Avatar name={name} size={36}/>
+                <div style={{flex:1}}><div style={{fontWeight:600,fontSize:14,color:C.ink}}>{name}</div><div style={{fontSize:12,color:C.faint}}>{last?`Last: ${fmtDate(last.date)}`:"No records yet"} · {totalRecs.filter(r=>r.type==="attendance").length} days logged</div></div>
+                <button type="button" onClick={()=>removeEmployee(name)} style={{background:"none",border:"1px solid #FECACA",borderRadius:7,padding:"5px 12px",cursor:"pointer",fontSize:12,color:C.danger,fontFamily:"inherit"}}>Remove</button>
+              </div>
+            })}
           </div>
-          <div style={{background:C.white,border:`1px solid ${C.line}`,borderRadius:14,padding:"22px"}}><h3 style={{margin:"0 0 6px",fontSize:15,fontWeight:700,color:C.ink}}>Backup &amp; Export</h3><p style={{fontSize:13,color:C.faint,margin:"0 0 16px",lineHeight:1.6}}>Download all reports and leave records as CSV.</p><button type="button" onClick={()=>exportCSV(reports,leaves)} style={{padding:"11px 22px",border:"none",borderRadius:10,background:G.brand,color:C.white,cursor:"pointer",fontSize:14,fontWeight:700,display:"flex",alignItems:"center",gap:8,fontFamily:"inherit"}}>Download CSV backup</button></div>
+
+          <div style={{background:C.white,border:`1px solid ${C.line}`,borderRadius:14,padding:"22px"}}>
+            <h3 style={{margin:"0 0 6px",fontSize:15,fontWeight:700,color:C.ink}}>Backup &amp; Export</h3>
+            <p style={{fontSize:13,color:C.faint,margin:"0 0 16px",lineHeight:1.6}}>Exports attendance and every task record separately with start/finish times — open in Excel for full analysis.</p>
+            <button type="button" onClick={exportCSV} style={{padding:"11px 22px",border:"none",borderRadius:10,background:G.brand,color:C.white,cursor:"pointer",fontSize:14,fontWeight:700,display:"flex",alignItems:"center",gap:8,fontFamily:"inherit"}}>Download CSV backup</button>
+          </div>
         </>}
+
       </div>
-      <ReportForm open={formOpen} onClose={()=>{setFormOpen(false);setEditRep(null)}} onSave={saveReport} existing={editRep} currentUser={null} prevTasks={[]}/>
-      <LeaveForm open={leaveOpen} onClose={()=>setLeaveOpen(false)} onSave={saveLeave} employees={employees}/>
-      <Confirm open={!!delTarget} title="Delete this report?" body={delTarget?`Permanently delete ${delTarget.name}'s report for ${fmtDate(delTarget.date)}?`:""} onYes={doDelete} onNo={()=>setDelTarget(null)}/>
+
+      <Confirm open={!!delTarget} title="Delete?" body={delTarget?`Delete this record?`:""} onYes={async()=>{await deleteRecord(delTarget);setDelTarget(null)}} onNo={()=>setDelTarget(null)}/>
       <Toast msg={toast.msg} type={toast.type}/>
     </div>
   )
