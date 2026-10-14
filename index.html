@@ -1239,8 +1239,8 @@ function App(){
   const[records,setRecords]=useState([])  // all records (attendance + tasks unified)
   const[adminPin,setAdminPin]=useState("admin123")
   const[loading,setLoading]=useState(true)
-  const[user,setUser]=useState(null)
-  const[isAdmin,setAdmin]=useState(false)
+  const[user,setUser]=useState(()=>{ try{return localStorage.getItem("tt_user")||null}catch{return null} })
+  const[isAdmin,setAdmin]=useState(()=>{ try{return localStorage.getItem("tt_admin")==="1"}catch{return false} })
   const[view,setView]=useState("today")
   const[selMonth,setSelMonth]=useState(mk(todayISO()))
   const[empFilter,setEmpFilter]=useState("")
@@ -1400,7 +1400,7 @@ function App(){
         <label style={LBL}>Select your name</label>
         {employees.length===0
           ?<div style={{padding:"18px",background:C.surface,borderRadius:10,fontSize:13,color:C.muted,textAlign:"center",marginBottom:16}}>No employees yet.<br/>Ask admin to add you first.</div>
-          :<select defaultValue="" onChange={e=>{if(e.target.value)setUser(e.target.value)}} style={{...INP,marginBottom:20,fontSize:15,appearance:"none"}}>
+          :<select defaultValue="" onChange={e=>{if(e.target.value){setUser(e.target.value);try{localStorage.setItem("tt_user",e.target.value);localStorage.removeItem("tt_admin")}catch{}}}} style={{...INP,marginBottom:20,fontSize:15,appearance:"none"}}>
             <option value="" disabled>— choose your name —</option>
             {employees.map(e=><option key={e} value={e}>{e}</option>)}
           </select>
@@ -1413,11 +1413,11 @@ function App(){
         <div style={{padding:"24px 26px"}}>
           <h3 style={{margin:"0 0 4px",fontSize:17,fontWeight:700,color:C.ink}}>Admin access</h3>
           <p style={{margin:"0 0 16px",fontSize:13,color:C.muted}}>Enter admin PIN to continue.</p>
-          <input type="password" value={pinInput} onChange={e=>setPinInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"){if(pinInput===adminPin){setAdmin(true);setUser("Admin");setPinOpen(false)}else setPinErr("Incorrect PIN.")}}} placeholder="Admin PIN" style={{...INP,marginBottom:6}} autoFocus/>
+          <input type="password" value={pinInput} onChange={e=>setPinInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"){if(pinInput===adminPin){setAdmin(true);setUser("Admin");setPinOpen(false);try{localStorage.setItem("tt_user","Admin");localStorage.setItem("tt_admin","1")}catch{}}else setPinErr("Incorrect PIN.")}}} placeholder="Admin PIN" style={{...INP,marginBottom:6}} autoFocus/>
           {pinErr&&<p style={{color:C.danger,fontSize:12,margin:"0 0 10px",fontWeight:600}}>{pinErr}</p>}
           <div style={{display:"flex",gap:9,marginTop:14}}>
             <button type="button" onClick={()=>setPinOpen(false)} style={{flex:1,padding:"10px",border:`1.5px solid ${C.line}`,borderRadius:9,background:"none",cursor:"pointer",fontSize:14,fontFamily:"inherit",color:C.muted}}>Cancel</button>
-            <button type="button" onClick={()=>{if(pinInput===adminPin){setAdmin(true);setUser("Admin");setPinOpen(false)}else setPinErr("Incorrect PIN.")}} style={{flex:1,padding:"10px",border:"none",borderRadius:9,background:G.brand,color:C.white,cursor:"pointer",fontSize:14,fontWeight:700,fontFamily:"inherit"}}>Sign in</button>
+            <button type="button" onClick={()=>{if(pinInput===adminPin){setAdmin(true);setUser("Admin");setPinOpen(false);try{localStorage.setItem("tt_user","Admin");localStorage.setItem("tt_admin","1")}catch{}}else setPinErr("Incorrect PIN.")}} style={{flex:1,padding:"10px",border:"none",borderRadius:9,background:G.brand,color:C.white,cursor:"pointer",fontSize:14,fontWeight:700,fontFamily:"inherit"}}>Sign in</button>
           </div>
         </div>
       </Modal>
@@ -1425,7 +1425,7 @@ function App(){
   )
 
   // ── EMPLOYEE VIEW ──
-  if(!isAdmin)return <EmpDashboard user={user} records={records} onSave={saveRecord} onDelete={deleteRecord} showToast={showToast} onLogout={()=>{setUser(null)}}/>
+  if(!isAdmin)return <EmpDashboard user={user} records={records} onSave={saveRecord} onDelete={deleteRecord} showToast={showToast} onLogout={()=>{setUser(null);try{localStorage.removeItem("tt_user");localStorage.removeItem("tt_admin")}catch{}}}/>
 
   // ── ADMIN VIEW ──
   return(
@@ -1438,7 +1438,7 @@ function App(){
           <div style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:8}}>
             <button type="button" onClick={exportCSV} style={{padding:"6px 12px",border:`1.5px solid ${C.line}`,borderRadius:8,background:"none",cursor:"pointer",fontSize:12,color:C.muted,fontFamily:"inherit"}}>Export CSV</button>
             <div style={{background:G.soft,padding:"4px 11px",borderRadius:99,display:"flex",alignItems:"center",gap:6}}><span style={{fontSize:10,background:G.brand,color:C.white,padding:"1px 7px",borderRadius:99,fontWeight:700}}>ADMIN</span></div>
-            <button type="button" onClick={()=>{setUser(null);setAdmin(false);setView("today")}} style={{background:"none",border:`1.5px solid ${C.line}`,borderRadius:8,padding:"5px 10px",cursor:"pointer",fontSize:12,color:C.faint,fontFamily:"inherit"}}>Log out</button>
+            <button type="button" onClick={()=>{setUser(null);setAdmin(false);setView("today");try{localStorage.removeItem("tt_user");localStorage.removeItem("tt_admin")}catch{}}} style={{background:"none",border:`1.5px solid ${C.line}`,borderRadius:8,padding:"5px 10px",cursor:"pointer",fontSize:12,color:C.faint,fontFamily:"inherit"}}>Log out</button>
           </div>
         </div>
       </div>
