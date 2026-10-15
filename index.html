@@ -141,7 +141,12 @@ function useAfkIdle(enabled){
       setIdleSecs(0)
     }
     events.forEach(e=>window.addEventListener(e,onActivity,{passive:true}))
+    // Reset idle timer whenever user comes back to this tab
+    const onVisible=()=>{ if(document.visibilityState==="visible") lastActivity.current=Date.now() }
+    document.addEventListener("visibilitychange",onVisible)
     intervalRef.current=setInterval(()=>{
+      // Don't count idle time while tab is hidden — user is working elsewhere
+      if(document.visibilityState==="hidden"){ lastActivity.current=Date.now(); return }
       const elapsed=Math.floor((Date.now()-lastActivity.current)/1000)
       setIdleSecs(elapsed)
       const warnAt=AFK_IDLE_MINS*60
@@ -152,6 +157,7 @@ function useAfkIdle(enabled){
     },1000)
     return()=>{
       events.forEach(e=>window.removeEventListener(e,onActivity))
+      document.removeEventListener("visibilitychange",onVisible)
       clearInterval(intervalRef.current)
     }
   },[enabled])
