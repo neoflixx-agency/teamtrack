@@ -931,16 +931,20 @@ function AdminEmployeeDay({name,date,records,onSave,onDelete,employees,autoAbsen
   },[att,autoAbsent])
 
   async function saveAtt(){
+    // Sync login_time/logout_time from sessions array (admin edits sessions directly)
+    const sessions=attForm.sessions&&attForm.sessions.length>0?attForm.sessions:null
+    const firstLogin=sessions?sessions[0]?.login||null:attForm.login_time||null
+    const lastLogout=sessions?sessions[sessions.length-1]?.logout||null:attForm.logout_time||null
     const payload=att
-      ?{...attForm}
+      ?{...attForm,sessions:sessions||attForm.sessions||[],login_time:firstLogin,logout_time:lastLogout}
       :{
           id:`att_${name.toLowerCase().replace(/\s+/g,"_")}_${date}_${uid()}`,
           name, date, type:"attendance",
           attendance:attForm.attendance||"absent",
-          login_time:attForm.login_time||null,
-          logout_time:attForm.logout_time||null,
+          login_time:firstLogin,
+          logout_time:lastLogout,
           summary:attForm.summary||"",
-          sessions:attForm.sessions||[]
+          sessions:sessions||[]
         }
     await onSave(payload)
     setEditAtt(false)
@@ -1001,9 +1005,16 @@ function AdminEmployeeDay({name,date,records,onSave,onDelete,employees,autoAbsen
             </button>
           ))}
         </div>
-        {attForm.attendance==="present"&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
-          <div><label style={{...LBL,fontSize:10}}>Login time</label><input type="time" style={INP} value={attForm.login_time||""} onChange={e=>setAttForm(f=>({...f,login_time:e.target.value}))}/></div>
-          <div><label style={{...LBL,fontSize:10}}>Logout time</label><input type="time" style={INP} value={attForm.logout_time||""} onChange={e=>setAttForm(f=>({...f,logout_time:e.target.value}))}/></div>
+        {attForm.attendance==="present"&&<div style={{marginBottom:10}}>
+          <div style={{fontSize:10,fontWeight:700,color:C.muted,textTransform:"uppercase",marginBottom:8}}>Sessions (admin can edit any time freely)</div>
+          {(attForm.sessions&&attForm.sessions.length>0?attForm.sessions:[{login:attForm.login_time||"",logout:attForm.logout_time||""}]).map((sess,i)=>(
+            <div key={i} style={{display:"grid",gridTemplateColumns:"1fr 1fr auto",gap:8,marginBottom:8,alignItems:"end"}}>
+              <div><label style={{...LBL,fontSize:10}}>S{i+1} Login</label><input type="time" style={INP} value={sess.login||""} onChange={e=>{const s=(attForm.sessions&&attForm.sessions.length>0)?[...attForm.sessions]:[{login:attForm.login_time||"",logout:attForm.logout_time||""}];s[i]={...s[i],login:e.target.value};setAttForm(f=>({...f,sessions:s,login_time:s[0]?.login||f.login_time}))}}/></div>
+              <div><label style={{...LBL,fontSize:10}}>S{i+1} Logout</label><input type="time" style={INP} value={sess.logout||""} onChange={e=>{const s=(attForm.sessions&&attForm.sessions.length>0)?[...attForm.sessions]:[{login:attForm.login_time||"",logout:attForm.logout_time||""}];s[i]={...s[i],logout:e.target.value};setAttForm(f=>({...f,sessions:s,logout_time:s[s.length-1]?.logout||f.logout_time}))}}/></div>
+              {i>0&&<button type="button" onClick={()=>{const s=[...attForm.sessions];s.splice(i,1);setAttForm(f=>({...f,sessions:s}))}} style={{...btnSm,background:"#FEF2F2",color:C.danger,padding:"7px 10px",alignSelf:"flex-end"}}>✕</button>}
+            </div>
+          ))}
+          <button type="button" onClick={()=>{const existing=(attForm.sessions&&attForm.sessions.length>0)?attForm.sessions:[{login:attForm.login_time||"",logout:attForm.logout_time||""}];setAttForm(f=>({...f,sessions:[...existing,{login:"",logout:""}]}))}} style={{...btnSm,background:"#EEF2FF",color:C.primary,padding:"6px 14px",fontSize:11,marginTop:2}}>+ Add session</button>
         </div>}
         <div style={{marginBottom:10}}><label style={{...LBL,fontSize:10}}>Note</label><input style={INP} value={attForm.summary||""} onChange={e=>setAttForm(f=>({...f,summary:e.target.value}))} placeholder="Optional note"/></div>
         <div style={{display:"flex",gap:8}}>
@@ -1014,18 +1025,29 @@ function AdminEmployeeDay({name,date,records,onSave,onDelete,employees,autoAbsen
 
       {/* Attendance display */}
       {!editAtt&&att?.attendance==="present"&&<>
-        {getSessions(att).map((sess,i)=><div key={i} style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}}>
-          <div style={{background:C.surface,borderRadius:8,padding:"9px 12px",border:`1px solid ${C.line}`}}>
-            <div style={{fontSize:10,fontWeight:700,color:C.faint,textTransform:"uppercase",marginBottom:2}}>{getSessions(att).length>1?`S${i+1} `:""}Login</div>
-            <div style={{fontSize:15,fontWeight:800,color:C.ink}}>{sess.login||"—"}</div>
-            {isLate(sess.login)&&i===0&&<div style={{fontSize:10,color:C.danger,fontWeight:600}}>Late</div>}
-          </div>
-          <div style={{background:sess.logout?C.surface:"#FFF7ED",borderRadius:8,padding:"9px 12px",border:`1px solid ${sess.logout?C.line:"#FDE68A"}`}}>
-            <div style={{fontSize:10,fontWeight:700,color:C.faint,textTransform:"uppercase",marginBottom:2}}>Logout</div>
-            <div style={{fontSize:15,fontWeight:800,color:sess.logout?C.ink:C.warning}}>{sess.logout||"Still in"}</div>
-            {sess.logout&&<div style={{fontSize:10,color:C.success,fontWeight:600}}>{fmtDur(calcMins(sess.login,sess.logout))}</div>}
-          </div>
-        </div>)}
+        {getSessions(att).map((sess,i)=>{
+          const sessions=getSessions(att);
+          const breakMins=i<sessions.length-1&&sess.logout&&sessions[i+1].login?calcMins(sess.logout,sessions[i+1].login):null;
+          return <React.Fragment key={i}>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}}>
+              <div style={{background:C.surface,borderRadius:8,padding:"9px 12px",border:`1px solid ${C.line}`}}>
+                <div style={{fontSize:10,fontWeight:700,color:C.faint,textTransform:"uppercase",marginBottom:2}}>{sessions.length>1?`S${i+1} `:""}Login</div>
+                <div style={{fontSize:15,fontWeight:800,color:C.ink}}>{sess.login||"—"}</div>
+                {isLate(sess.login)&&i===0&&<div style={{fontSize:10,color:C.danger,fontWeight:600}}>Late</div>}
+              </div>
+              <div style={{background:sess.logout?C.surface:"#FFF7ED",borderRadius:8,padding:"9px 12px",border:`1px solid ${sess.logout?C.line:"#FDE68A"}`}}>
+                <div style={{fontSize:10,fontWeight:700,color:C.faint,textTransform:"uppercase",marginBottom:2}}>Logout</div>
+                <div style={{fontSize:15,fontWeight:800,color:sess.logout?C.ink:C.warning}}>{sess.logout||"Still in"}</div>
+                {sess.logout&&<div style={{fontSize:10,color:C.success,fontWeight:600}}>{fmtDur(calcMins(sess.login,sess.logout))}</div>}
+              </div>
+            </div>
+            {breakMins!==null&&breakMins>0&&<div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+              <div style={{flex:1,height:1,background:C.line}}/>
+              <div style={{fontSize:11,color:C.muted,background:"#FFFBEB",border:`1px solid #FDE68A`,borderRadius:99,padding:"3px 12px",fontWeight:600}}>☕ Lunch / Break: {fmtDur(breakMins)}</div>
+              <div style={{flex:1,height:1,background:C.line}}/>
+            </div>}
+          </React.Fragment>
+        })}
         <PunchBar loginTime={firstLogin(getSessions(att))} logoutTime={lastLogout(getSessions(att))}/>
         <div style={{display:"flex",gap:16,marginTop:8,fontSize:12,flexWrap:"wrap"}}>
           <span style={{color:C.muted}}>In office: <strong style={{color:C.primary}}>{fmtDur(totalSessionMins(getSessions(att)))}</strong></span>
