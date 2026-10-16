@@ -932,7 +932,14 @@ function AdminEmployeeDay({name,date,records,onSave,onDelete,employees,autoAbsen
 
   async function saveAtt(){
     // Sync login_time/logout_time from sessions array (admin edits sessions directly)
-    const sessions=attForm.sessions&&attForm.sessions.length>0?attForm.sessions:null
+    // Auto-sort sessions by login time so order is always chronological
+    let sessions=attForm.sessions&&attForm.sessions.length>0?attForm.sessions:null
+    if(sessions){
+      sessions=[...sessions].filter(s=>s.login||s.logout).sort((a,b)=>{
+        const toMins=t=>{if(!t)return 9999;const[h,m]=t.split(":").map(Number);return h*60+m}
+        return toMins(a.login)-toMins(b.login)
+      })
+    }
     const firstLogin=sessions?sessions[0]?.login||null:attForm.login_time||null
     const lastLogout=sessions?sessions[sessions.length-1]?.logout||null:attForm.logout_time||null
     const payload=att
