@@ -64,7 +64,8 @@ function totalBreakMins(sessions, attRec){
 // Backward compat: if old record has login_time/logout_time, treat as single session
 function getSessions(rec){
   if(!rec)return[]
-  if(rec.sessions&&rec.sessions.length)return rec.sessions
+  const toMins=t=>{if(!t)return 9999;const[h,m]=t.split(":").map(Number);return h*60+m}
+  if(rec.sessions&&rec.sessions.length)return [...rec.sessions].sort((a,b)=>toMins(a.login)-toMins(b.login))
   if(rec.login_time)return[{login:rec.login_time,logout:rec.logout_time||null}]
   return[]
 }
