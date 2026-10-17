@@ -918,6 +918,18 @@ function AdminEmployeeDay({name,date,records,onSave,onDelete,employees,autoAbsen
   const totalTask = tasks.reduce((s,t)=>s+calcMins(t.start_time,t.end_time),0)
   const done = tasks.filter(t=>t.status==="done").length
 
+  // Premiere Pro tracking
+  const[premiereData,setPremiereData]=useState(null)
+  useEffect(()=>{
+    async function fetchPremiere(){
+      try{
+        const res=await fetch(`${SUPABASE_URL}/rest/v1/app_tracking?name=eq.${encodeURIComponent(name)}&date=eq.${date}&select=premiere_mins,premiere_sessions`,{headers:{"apikey":SUPABASE_KEY,"Authorization":`Bearer ${SUPABASE_KEY}`}})
+        if(res.ok){const d=await res.json();if(d&&d.length>0)setPremiereData(d[0])}
+      }catch(e){}
+    }
+    fetchPremiere()
+  },[name,date])
+
   // Edit state
   const[editAtt,setEditAtt]=useState(false)
   const[editTask,setEditTask]=useState(null)
@@ -1078,7 +1090,13 @@ function AdminEmployeeDay({name,date,records,onSave,onDelete,employees,autoAbsen
     {/* Tasks section */}
     <div style={{background:"#FAFAFA",padding:"12px 16px"}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
-        <div style={{fontSize:11,fontWeight:700,color:C.muted,textTransform:"uppercase",letterSpacing:"0.05em"}}>Task log ({tasks.length})</div>
+        <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+          <div style={{fontSize:11,fontWeight:700,color:C.muted,textTransform:"uppercase",letterSpacing:"0.05em"}}>Task log ({tasks.length})</div>
+          {premiereData&&premiereData.premiere_mins>0&&<div style={{display:"flex",alignItems:"center",gap:5,background:"#EDE9FE",borderRadius:99,padding:"3px 10px"}}>
+            <span style={{fontSize:13}}>🎬</span>
+            <span style={{fontSize:11,fontWeight:700,color:"#6D28D9"}}>Premiere: {fmtDur(premiereData.premiere_mins)}</span>
+          </div>}
+        </div>
         <button type="button" onClick={()=>setAddingTask(true)} style={{...btnSm,background:"#DCFCE7",color:C.success,padding:"5px 12px"}}>+ Add task</button>
       </div>
 
